@@ -1,0 +1,81 @@
+[package]
+name = "hachidori-relay"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "GPL-3.0-or-later"
+description = "Standalone Rust reimplementation of the Hachidori sharing relay and its Yomitan-compatible HTTP API"
+readme = "README.md"
+repository = "https://github.com/bee-san/hachidori-anki"
+keywords = ["hachidori", "yomitan", "websocket", "relay", "anki"]
+categories = ["network-programming", "command-line-utilities"]
+exclude = ["/tests/conformance/node_modules", "/.github"]
+
+[lib]
+name = "hachidori_relay"
+path = "src/lib.rs"
+
+[[bin]]
+name = "hachidori-relay"
+path = "src/main.rs"
+required-features = ["cli"]
+
+[features]
+default = ["cli"]
+# The command-line binary: argument parsing, logging to stderr, signal handling.
+# Embedders (e.g. chidoripop) depend on the library with `default-features = false`.
+cli = ["dep:clap", "dep:tracing-subscriber", "tokio/rt-multi-thread", "tokio/signal"]
+
+[dependencies]
+base64 = "0.23.1"
+bytes = "1.12.1"
+http-body = "1.1.0"
+http-body-util = "0.1.5"
+hyper = { version = "1.12.0", features = ["server", "http1"] }
+hyper-util = { version = "0.1.21", features = ["tokio"] }
+percent-encoding = "2.3.2"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.154", features = ["raw_value"] }
+sha1_smol = "1.0.1"
+socket2 = "0.6.5"
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = ["rt", "net", "io-util", "time", "sync", "macros"] }
+tracing = "0.1.44"
+
+clap = { version = "4.6.7", optional = true, default-features = false, features = ["std", "help", "usage", "error-context", "derive", "suggestions"] }
+tracing-subscriber = { version = "0.3.23", optional = true, default-features = false, features = ["fmt", "env-filter", "ansi", "std"] }
+
+[dev-dependencies]
+tokio = { version = "1.54.1", features = ["full"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+unreachable_pub = "warn"
+unused_qualifications = "warn"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+perf = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+cargo = { level = "warn", priority = -1 }
+# Transitive duplicates are outside this crate's control.
+multiple_crate_versions = "allow"
+module_name_repetitions = "allow"
+unwrap_used = "warn"
+expect_used = "warn"
+dbg_macro = "warn"
+print_stdout = "warn"
+print_stderr = "warn"
+todo = "warn"
+large_futures = "warn"
+needless_pass_by_ref_mut = "warn"
+redundant_clone = "warn"
+significant_drop_tightening = "warn"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"

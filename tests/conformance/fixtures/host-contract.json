@@ -1,0 +1,114 @@
+{
+  "hello": {
+    "kind": "hello",
+    "protocol": 1,
+    "version": "hachidori-relay/0.1.0",
+    "name": "Hachidori Relay API",
+    "capabilities": ["hoshidicts-api-v1"]
+  },
+  "hostHello": {
+    "kind": "hello",
+    "protocol": 1,
+    "version": "0.9.0",
+    "name": "Fake Hachidori",
+    "dictionaryCount": 2,
+    "capabilities": ["hoshidicts-api-v1"],
+    "snapshot": {}
+  },
+  "request": {
+    "kind": "request",
+    "id": "api-1",
+    "message": { "target": "hoshidicts-offscreen", "type": "hd_api_version" }
+  },
+  "reply": {
+    "kind": "reply",
+    "id": "api-1",
+    "response": { "version": "0.9.0" }
+  },
+  "hd_api_version": {
+    "request": {},
+    "reply": { "version": "0.9.0" }
+  },
+  "hd_api_term_entries": {
+    "request": { "terms": ["分かる"] },
+    "reply": {
+      "results": [
+        {
+          "index": 0,
+          "dictionaryEntries": [
+            { "type": "term", "isPrimary": true, "headwords": [{ "term": "分かる", "reading": "わかる" }], "definitions": [] }
+          ],
+          "originalTextLength": 3
+        }
+      ]
+    }
+  },
+  "hd_api_kanji_entries": {
+    "request": { "characters": ["分"] },
+    "reply": {
+      "results": [
+        { "index": 0, "dictionaryEntries": [{ "type": "kanji", "character": "分", "dictionary": "KANJIDIC" }] }
+      ]
+    }
+  },
+  "hd_api_anki_fields": {
+    "request": { "text": "分かる", "entryType": "term", "markers": ["expression", "reading"], "maxEntries": 1, "includeMedia": true },
+    "reply": {
+      "fields": [{ "expression": "分かる", "reading": "わかる" }],
+      "dictionaryMedia": [],
+      "audioMedia": [
+        { "term": "分かる", "reading": "わかる", "mediaType": "audio/mpeg", "content": "AAEC", "ankiFilename": "hachidori_audio_1.mp3" }
+      ]
+    }
+  },
+  "hd_api_anki_card_formats": {
+    "request": { "profileIndex": 0 },
+    "reply": {
+      "cardFormats": [
+        {
+          "name": "Default",
+          "icon": "big-circle",
+          "deck": "Mining",
+          "model": "Lapis",
+          "fields": {
+            "Expression": { "value": "{expression}", "overwriteMode": "coalesce" },
+            "Sentence": { "value": "{cloze-prefix}<b>{cloze-body}</b>{cloze-suffix}", "overwriteMode": "coalesce" },
+            "Hint": { "value": "", "overwriteMode": "coalesce" }
+          },
+          "type": "term"
+        }
+      ]
+    }
+  },
+  "hd_api_tokenize": {
+    "request": { "texts": ["大きい"], "scanLength": 10, "parser": "scanning-parser" },
+    "reply": {
+      "results": [
+        { "id": "scan", "source": "scanning-parser", "dictionary": null, "index": 0, "content": [[{ "text": "大", "reading": "おお" }, { "text": "きい", "reading": "" }]] }
+      ]
+    }
+  },
+  "hd_api_dictionaries": {
+    "request": {},
+    "reply": {
+      "dictionaries": [
+        { "id": "jitendex", "title": "Jitendex.org [2025-05-13]", "revision": "2025-05-13", "size": 20971520, "fileName": "jitendex.hachidori.zip" },
+        { "id": "kanjidic", "title": "KANJIDIC [2025-145]", "revision": "2025-145", "size": 4096, "fileName": "kanjidic.hachidori.zip" }
+      ]
+    }
+  },
+  "hd_api_dictionary_open": {
+    "request": { "id": "kanjidic" },
+    "reply": { "token": "dl-1", "size": 4096, "fileName": "kanjidic.hachidori.zip" },
+    "notFound": { "error": "unknown dictionary", "notFound": true }
+  },
+  "hd_api_dictionary_read": {
+    "request": { "token": "dl-1", "offset": 0, "length": 4194304 },
+    "reply": { "data": "UEsDBBQAAAAIAA==", "eof": true }
+  },
+  "hd_api_dictionary_close": {
+    "request": { "token": "dl-1" },
+    "reply": {}
+  },
+  "error": { "error": "no dictionary matched" }
+}
