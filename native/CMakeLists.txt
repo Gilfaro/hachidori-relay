@@ -15,6 +15,13 @@ set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 set(CMAKE_NO_SYSTEM_FROM_IMPORTED ON)
 
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../third_party/hoshidicts hoshidicts EXCLUDE_FROM_ALL)
+if(MSVC)
+  # Hoshidicts' zstd_compress_sequences.c override uses <stdatomic.h>, which MSVC only
+  # allows in C11 mode with C11 atomics enabled (GCC and Clang accept it at the C99 the
+  # tree asks for).
+  set_property(TARGET libzstd_static PROPERTY C_STANDARD 11)
+  target_compile_options(libzstd_static PRIVATE $<$<COMPILE_LANGUAGE:C>:/experimental:c11atomics>)
+endif()
 
 add_library(hachidori_native STATIC bindings.cpp)
 target_link_libraries(hachidori_native PRIVATE hoshidicts glaze::glaze)

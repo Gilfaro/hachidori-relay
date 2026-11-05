@@ -27,6 +27,13 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      # Hoshidicts is C++23 and uses std::ranges::to, which needs GCC 14; Ubuntu 24.04
+      # defaults to GCC 13 but has 14 preinstalled.
+      - name: GCC 14 (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          echo "CC=gcc-14" >> "$GITHUB_ENV"
+          echo "CXX=g++-14" >> "$GITHUB_ENV"
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -51,6 +58,13 @@ jobs:
           submodules: recursive
       - uses: dtolnay/rust-toolchain@1.88
       - uses: Swatinem/rust-cache@v2
+      # Hoshidicts is C++23 and uses std::ranges::to, which needs GCC 14; Ubuntu 24.04
+      # defaults to GCC 13 but has 14 preinstalled.
+      - name: GCC 14 (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          echo "CC=gcc-14" >> "$GITHUB_ENV"
+          echo "CXX=g++-14" >> "$GITHUB_ENV"
       - run: cargo check --all-targets --all-features
 
   audit:
