@@ -1,0 +1,28 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# The native Hoshidicts engine for host mode, built by build.rs through the cmake
+# crate. hachidori_native is the C ABI in bindings.cpp; every static library it
+# needs is installed into lib/ so build.rs can link them by name.
+cmake_minimum_required(VERSION 3.22.1)
+project(hachidori_native LANGUAGES C CXX)
+
+set(CMAKE_CXX_STANDARD 23)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_C_STANDARD 99)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+# Imported targets such as Iconv::Iconv may name the compiler's own include
+# directory; as -isystem that breaks #include_next in libstdc++ (mingw).
+set(CMAKE_NO_SYSTEM_FROM_IMPORTED ON)
+
+add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../third_party/hoshidicts hoshidicts EXCLUDE_FROM_ALL)
+
+add_library(hachidori_native STATIC bindings.cpp)
+target_link_libraries(hachidori_native PRIVATE hoshidicts glaze::glaze)
+# hdw_import reads an archive's title through the engine's private zip reader.
+target_include_directories(hachidori_native PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../third_party/hoshidicts/src)
+if(MSVC)
+  target_compile_options(hachidori_native PRIVATE /utf-8)
+endif()
+
+set(HACHIDORI_NATIVE_LIBS hachidori_native hoshidicts libzstd_static libdeflate_static utf8proc lzokay gumbo)
+install(TARGETS ${HACHIDORI_NATIVE_LIBS} ARCHIVE DESTINATION lib)

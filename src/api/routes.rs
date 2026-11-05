@@ -348,8 +348,16 @@ fn chunk_data(data: Option<&RawValue>) -> Option<Vec<u8>> {
     empty.then(Vec::new)
 }
 
-async fn download(server: &Server, id: &str) -> Result<Response<Body>, ApiError> {
-    let session = server.session().await?;
+/// A download the host has opened: its lease token, its length when known, and its file name.
+pub(crate) struct Opened {
+    pub(crate) token: Value,
+    pub(crate) size: Option<u64>,
+    pub(crate) file_name: String,
+}
+
+/// Asks the host to open dictionary `id` for download. A lease the host grants after
+/// the wait is over is released at once.
+pub(crate) async fn open_download(session: &Arc<Session>, id: &str, timeout: std::time::Duration) -> Result<Opened, ApiError> {
     let late: Late = {
         let session = session.clone();
         // The host granted the lease after we stopped waiting. Release it anyway.
@@ -359,7 +367,7 @@ async fn download(server: &Server, id: &str) -> Result<Response<Body>, ApiError>
             }
         })
     };
-    let opened = session.request("hd_api_dictionary_open", &object(json!({ "id": id })), server.lookup_timeout, Some(late)).await?;
+    let opened = session.request("hd_api_dictionary_open", &object(json!({ "id": id })), timeout, Some(late)).await?;
     let token = token_of(&opened).ok_or_else(ApiError::malformed)?;
     let fields = json::fields(&opened).unwrap_or_default();
     let size = fields.get("size").and_then(|raw| raw.get().trim().parse::<u64>().ok());
@@ -368,7 +376,12 @@ async fn download(server: &Server, id: &str) -> Result<Response<Body>, ApiError>
         .and_then(|raw| json::as_str(raw))
         .filter(|name| !name.is_empty())
         .map_or_else(|| format!("{id}.zip"), std::borrow::Cow::into_owned);
+    Ok(Opened { token, size, file_name })
+}
 
+async fn download(server: &Server, id: &str) -> Result<Response<Body>, ApiError> {
+    let session = server.session().await?;
+    let Opened { token, size, file_name } = open_download(&session, id, server.lookup_timeout).await?;
     let (chunks, receiver) = mpsc::channel(1);
     tokio::spawn(stream_chunks(session, token, size, chunks, server.chunk_timeout));
     let mut builder = base(StatusCode::OK).header(header::CONTENT_TYPE, "application/zip");
@@ -397,7 +410,7 @@ impl Drop for CloseToken {
 
 /// Reads the dictionary in order, 4 MiB at a time, and passes each chunk on as it arrives.
 /// At most one chunk waits for a slow client, so a download never holds the whole file.
-async fn stream_chunks(
+pub(crate) async fn stream_chunks(
     session: Arc<Session>,
     token: Value,
     size: Option<u64>,

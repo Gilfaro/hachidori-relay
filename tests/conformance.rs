@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Runs upstream's Node socket and HTTP suites (vendored in `tests/conformance`)
 //! against the built binary. They are the acceptance tests for 1:1 behaviour.
-//! It also runs `limits.test.mjs`, which tests the relay's own safety limits.
+//! It also runs `limits.test.mjs`, which tests the relay's own safety limits, and
+//! `host.test.mjs`, which tests host mode (skipped in a build without it).
 //! Needs Node 22 or later. Without Node, this test reports that and passes.
 #![cfg(feature = "cli")]
 #![allow(clippy::print_stderr, missing_docs)]
@@ -24,6 +25,7 @@ fn upstream_node_suites_pass_against_the_binary() {
             "tests/conformance/sharing-relay.test.mjs",
             "tests/conformance/api.test.mjs",
             "tests/conformance/limits.test.mjs",
+            "tests/conformance/host.test.mjs",
         ])
         .env("HACHIDORI_RELAY_BIN", env!("CARGO_BIN_EXE_hachidori-relay"))
         .current_dir(root)

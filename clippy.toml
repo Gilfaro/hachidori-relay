@@ -1,0 +1,3 @@
+# AnkiConnect is the add-on's name, not code.
+doc-valid-idents = ["AnkiConnect", ".."]
+allow-unwrap-in-tests = true

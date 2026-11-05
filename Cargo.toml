@@ -1,6 +1,6 @@
 [package]
 name = "hachidori-relay"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.88"
 license = "GPL-3.0-or-later"
@@ -9,7 +9,8 @@ readme = "README.md"
 repository = "https://github.com/bee-san/hachidori-anki"
 keywords = ["hachidori", "yomitan", "websocket", "relay", "anki"]
 categories = ["network-programming", "command-line-utilities"]
-exclude = ["/tests/conformance/node_modules", "/.github"]
+exclude = ["/tests/conformance/node_modules", "/.github", "/third_party/hoshidicts/external/*/tests", "/third_party/hoshidicts/external/*/docs", "/third_party/hoshidicts/external/glaze/fuzzing"]
+build = "build.rs"
 
 [lib]
 name = "hachidori_relay"
@@ -25,6 +26,9 @@ default = ["cli"]
 # The command-line binary: argument parsing, logging to stderr, signal handling.
 # Embedders (e.g. chidoripop) depend on the library with `default-features = false`.
 cli = ["dep:clap", "dep:tracing-subscriber", "tokio/rt-multi-thread", "tokio/signal"]
+# Host mode: the relay is itself the sharing Hachidori, and mirrors a browser host's
+# configuration and dictionaries into a data directory (`--host`). Off by default.
+host = ["dep:ureq", "dep:icu_properties", "dep:zip", "zip/deflate-flate2", "dep:flate2", "dep:cmake", "dep:icu_collator", "dep:icu_normalizer", "dep:url", "dep:sha2", "dep:getrandom", "tokio/fs"]
 
 [dependencies]
 base64 = "0.23.1"
@@ -44,12 +48,28 @@ tracing = "0.1.44"
 
 clap = { version = "4.6.7", optional = true, default-features = false, features = ["std", "help", "usage", "error-context", "derive", "suggestions"] }
 tracing-subscriber = { version = "0.3.23", optional = true, default-features = false, features = ["fmt", "env-filter", "ansi", "std"] }
+zip = { version = "9.3.0", default-features = false, optional = true }
+# Uploaded dictionaries are deflated ZIPs; the relay reads their index.json.
+flate2 = { version = "1.1", optional = true, default-features = false, features = ["rust_backend"] }
+icu_collator = { version = "2.4.0", optional = true }
+icu_normalizer = { version = "2.4.0", optional = true }
+icu_properties = { version = "2.4.0", optional = true }
+# AnkiConnect, and pronunciation audio for Anki notes.
+ureq = { version = "3.5.1", optional = true, default-features = false, features = ["rustls", "gzip"] }
+url = { version = "2.5.8", optional = true }
+sha2 = { version = "0.11.1", optional = true }
+getrandom = { version = "0.4.3", optional = true }
+
+[build-dependencies]
+cmake = { version = "0.1.58", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1.54.1", features = ["full"] }
+zip = { version = "9.3.0", default-features = false }
 
 [lints.rust]
-unsafe_code = "forbid"
+# Allowed only in src/host/engine/ffi.rs, the one FFI module.
+unsafe_code = "deny"
 missing_docs = "warn"
 unreachable_pub = "warn"
 unused_qualifications = "warn"

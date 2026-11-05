@@ -9,7 +9,8 @@ import { fileURLToPath } from "node:url";
 export const RELAY_VERSION = readFileSync(new URL("../../Cargo.toml", import.meta.url), "utf8").match(/^version\s*=\s*"([^"]+)"/mu)[1];
 
 // HACHIDORI_RELAY_BIN is the built binary (cargo test sets it); the debug build is the fallback.
-function relayBinary() {
+// Exported for host.test.mjs (not in upstream).
+export function relayBinary() {
   if (process.env.HACHIDORI_RELAY_BIN) return process.env.HACHIDORI_RELAY_BIN;
   const exe = process.platform === "win32" ? "hachidori-relay.exe" : "hachidori-relay";
   return fileURLToPath(new URL(`../../target/debug/${exe}`, import.meta.url));
@@ -21,6 +22,8 @@ export async function startAnkiRelayServer({ port = 0, pingMs = 20_000, apiPort,
   const args = ["--port", String(port), "--ping-seconds", String(pingMs / 1000), ...extraArgs];
   if (apiPort !== undefined) args.push("--api-port", String(apiPort));
   if (apiTimeoutSeconds !== undefined) args.push("--api-timeout-seconds", String(apiTimeoutSeconds));
+  // Host-mode suites read storage.json while the relay runs: write each change at once.
+  if (extraArgs.includes("--host") && !extraArgs.includes("--write-delay")) args.push("--write-delay", "0");
   const child = spawn(relayBinary(), args, { stdio: ["ignore", "pipe", "inherit"] });
   let exitCode = null;
   const exited = new Promise((resolveExit) => child.once("exit", (code, signal) => {

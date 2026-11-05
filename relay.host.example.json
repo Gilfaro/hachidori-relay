@@ -1,0 +1,11 @@
+{
+  "port": 8771,
+  "yomitan_api_port": 19633,
+  "host": true,
+  "data_dir": "host-data",
+  "network": false,
+  "write_delay": 5,
+  "log": "info",
+  "ping_seconds": 20,
+  "worker_threads": 2
+}

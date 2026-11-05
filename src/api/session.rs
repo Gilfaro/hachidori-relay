@@ -56,9 +56,23 @@ struct State {
     capabilities: Vec<String>,
 }
 
+/// What a pulling session hears from the browser host besides replies (host mode).
+/// Each value is the frame's field as the host sent it.
+#[derive(Debug)]
+#[cfg_attr(not(feature = "host"), allow(dead_code, reason = "used by host mode"))]
+pub(crate) enum HostNews {
+    /// The answer to the session's `hello`: the host's shared storage.
+    Snapshot(Box<RawValue>),
+    /// A `storage` broadcast: the changed shared keys, `null` for a removed one.
+    Storage(Box<RawValue>),
+}
+
 /// One session toward the current host. A new one replaces it after the host goes away.
 pub(crate) struct Session {
     relay: Arc<Shared>,
+    /// `Some` for host mode's pull session, which always talks to the browser host and
+    /// reports what that host shares.
+    news: Option<mpsc::UnboundedSender<HostNews>>,
     hello_version: String,
     lookup_timeout: Duration,
     state: Mutex<State>,
@@ -107,12 +121,27 @@ struct Inbound<'a> {
     capabilities: Option<&'a RawValue>,
     #[serde(default, borrow, deserialize_with = "json::present")]
     reason: Option<&'a RawValue>,
+    #[serde(default, borrow, deserialize_with = "json::present")]
+    snapshot: Option<&'a RawValue>,
+    #[serde(default, borrow, deserialize_with = "json::present")]
+    changes: Option<&'a RawValue>,
 }
 
 impl Session {
     pub(crate) fn new(relay: Arc<Shared>, version: &str, lookup_timeout: Duration) -> Arc<Self> {
+        Self::with_news(relay, version, lookup_timeout, None)
+    }
+
+    /// Host mode's session toward the browser host, which reports the host's shared storage to `news`.
+    #[cfg_attr(not(feature = "host"), allow(dead_code, reason = "used by host mode"))]
+    pub(crate) fn pulling(relay: Arc<Shared>, version: &str, lookup_timeout: Duration, news: mpsc::UnboundedSender<HostNews>) -> Arc<Self> {
+        Self::with_news(relay, version, lookup_timeout, Some(news))
+    }
+
+    fn with_news(relay: Arc<Shared>, version: &str, lookup_timeout: Duration, news: Option<mpsc::UnboundedSender<HostNews>>) -> Arc<Self> {
         Arc::new(Self {
             relay,
+            news,
             hello_version: format!("hachidori-relay/{version}"),
             lookup_timeout,
             state: Mutex::new(State { alive: true, failure: None, pending: HashMap::new(), next_id: 0, capabilities: Vec::new() }),
@@ -146,7 +175,12 @@ impl Session {
         }
         if self.client.get().is_none() {
             let (events, receiver) = mpsc::unbounded_channel();
-            let Some(Role::Client(id)) = self.relay.connect_client(Peer::Api(events), API_ORIGIN, API_ADDRESS) else {
+            let connected = if self.news.is_some() {
+                self.relay.connect_browser_client(Peer::Api(events), API_ORIGIN, API_ADDRESS)
+            } else {
+                self.relay.connect_client(Peer::Api(events), API_ORIGIN, API_ADDRESS)
+            };
+            let Some(Role::Client(id)) = connected else {
                 self.lost(NO_HOST, false);
                 return Err(ApiError::unavailable(NO_HOST));
             };
@@ -264,7 +298,15 @@ impl Session {
                     .map(|items| items.into_iter().filter_map(json::as_str).map(Cow::into_owned).collect())
                     .unwrap_or_default();
                 self.lock().capabilities = capabilities;
+                if let (Some(news), Some(snapshot)) = (&self.news, frame.snapshot) {
+                    let _ = news.send(HostNews::Snapshot(snapshot.to_owned()));
+                }
                 self.hello.send_replace(true);
+            }
+            Some("storage") => {
+                if let (Some(news), Some(changes)) = (&self.news, frame.changes) {
+                    let _ = news.send(HostNews::Storage(changes.to_owned()));
+                }
             }
             Some("reply") => {
                 let Some(id) = frame.id.and_then(json::as_str) else { return };
@@ -314,7 +356,7 @@ impl Session {
     }
 
     /// Ends the session from this side, so the host sees the client close.
-    fn close(&self) {
+    pub(crate) fn close(&self) {
         self.lost(CLOSED_HERE, true);
     }
 }

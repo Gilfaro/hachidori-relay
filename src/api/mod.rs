@@ -7,8 +7,8 @@
 //! dictionaries with `GET /dictionaries`, and download one with `GET /dictionaries/<id>`.
 
 mod body;
-mod routes;
-mod session;
+pub(crate) mod routes;
+pub(crate) mod session;
 
 use std::borrow::Cow;
 use std::convert::Infallible;

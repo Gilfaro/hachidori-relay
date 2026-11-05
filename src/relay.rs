@@ -22,6 +22,22 @@ use crate::net::{self, LocalAddress};
 use crate::ws::peer::Peer;
 use crate::{ApiStatus, Builder, Error, Limits, Relay, api, json, ws};
 
+/// Answers linked clients in place of a browser host. Host mode installs one; without
+/// it, every client is forwarded to the browser host as upstream does.
+///
+/// The relay calls it without holding its own lock, so it may call straight back into
+/// [`Shared::send_to_client`], [`Shared::broadcast_local`] or [`Shared::close_local_client`].
+pub(crate) trait LocalHost: Send + Sync {
+    /// A client connected.
+    fn opened(&self, client: &Arc<str>, origin: &str, address: IpAddr);
+    /// One whole text message from that client.
+    fn text(&self, client: &Arc<str>, text: &str);
+    /// The client is gone, whichever side closed it.
+    fn closed(&self, client: &Arc<str>);
+    /// The relay is shutting down: save what is not saved yet.
+    fn shutdown(&self) {}
+}
+
 /// Which side of the relay a connection is.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Role {
@@ -107,6 +123,8 @@ struct Host {
 struct Client {
     peer: Peer,
     address: IpAddr,
+    /// Answered by the [`LocalHost`] rather than the browser host.
+    local: bool,
 }
 
 #[derive(Default)]
@@ -115,6 +133,13 @@ struct State {
     clients: HashMap<Arc<str>, Client>,
     next_client: u64,
     next_host: u64,
+}
+
+impl State {
+    fn next_id(&mut self) -> Arc<str> {
+        self.next_client += 1;
+        format!("client-{}", self.next_client).into()
+    }
 }
 
 /// The relay, shared by every connection task.
@@ -126,6 +151,9 @@ pub(crate) struct Shared {
     api_listener: OnceLock<Listener>,
     switching: tokio::sync::Mutex<()>,
     fatal: watch::Sender<Option<Arc<io::Error>>>,
+    local: OnceLock<Arc<dyn LocalHost>>,
+    /// The id of the connected browser host, if any.
+    browser: watch::Sender<Option<u64>>,
 }
 
 impl Shared {
@@ -138,6 +166,8 @@ impl Shared {
             api_listener: OnceLock::new(),
             switching: tokio::sync::Mutex::new(()),
             fatal,
+            local: OnceLock::new(),
+            browser: watch::channel(None).0,
         }
     }
 
@@ -151,8 +181,22 @@ impl Shared {
         &self.limits
     }
 
+    /// Whether a linked client would be answered now: always in host mode, otherwise
+    /// only while a browser host is connected.
     pub(crate) fn has_host(&self) -> bool {
-        self.lock().host.is_some()
+        self.local.get().is_some() || self.lock().host.is_some()
+    }
+
+    /// Makes `local` answer every client that connects from now on (host mode).
+    #[cfg_attr(not(feature = "host"), allow(dead_code, reason = "used by host mode"))]
+    pub(crate) fn set_local(&self, local: Arc<dyn LocalHost>) {
+        let _ = self.local.set(local);
+    }
+
+    /// Follows the browser host: its connection id while one is connected.
+    #[cfg_attr(not(feature = "host"), allow(dead_code, reason = "used by host mode"))]
+    pub(crate) fn browser_host(&self) -> watch::Receiver<Option<u64>> {
+        self.browser.subscribe()
     }
 
     /// Takes a new host connection. If another host already shares, the newcomer is
@@ -168,17 +212,32 @@ impl Shared {
         peer.send(ToHost::Listening { port: self.port }.encode());
         state.host = Some(Host { id, peer });
         drop(state);
+        self.browser.send_replace(Some(id));
         Some(Role::Host(id))
     }
 
-    /// Takes a new linked client, or gives `None` while no host is connected.
+    /// Takes a new linked client. With a [`LocalHost`] it is always taken and answered
+    /// here. Otherwise it goes to the browser host, and is refused (`None`) while there is none.
     pub(crate) fn connect_client(&self, peer: Peer, origin: &str, address: IpAddr) -> Option<Role> {
+        let Some(local) = self.local.get() else { return self.connect_browser_client(peer, origin, address) };
+        let id = {
+            let mut state = self.lock();
+            let id = state.next_id();
+            state.clients.insert(id.clone(), Client { peer, address, local: true });
+            id
+        };
+        local.opened(&id, origin, address);
+        Some(Role::Client(id))
+    }
+
+    /// Takes a client for the browser host whether or not a [`LocalHost`] is installed
+    /// (host mode's own pull session). `None` while no browser host is connected.
+    pub(crate) fn connect_browser_client(&self, peer: Peer, origin: &str, address: IpAddr) -> Option<Role> {
         let mut state = self.lock();
         let host = state.host.as_ref()?.peer.clone();
-        state.next_client += 1;
-        let id: Arc<str> = format!("client-{}", state.next_client).into();
+        let id = state.next_id();
         host.send(ToHost::ClientOpen { client_id: &id, origin, address: address.to_string() }.encode());
-        state.clients.insert(id.clone(), Client { peer, address });
+        state.clients.insert(id.clone(), Client { peer, address, local: false });
         drop(state);
         Some(Role::Client(id))
     }
@@ -191,13 +250,44 @@ impl Shared {
         }
     }
 
-    /// Text from a client, wrapped for the host.
+    /// Text from a client: to the [`LocalHost`], or wrapped for the browser host.
     pub(crate) fn client_text(&self, client_id: &str, text: &str) {
-        // The JSON escaping happens before the lock is taken, so a large text does
-        // not hold up the other connections.
+        if let Some(local) = self.local.get() {
+            let id = self.lock().clients.get_key_value(client_id).filter(|(_, client)| client.local).map(|(id, _)| id.clone());
+            if let Some(id) = id {
+                local.text(&id, text);
+                return;
+            }
+        }
+        // The JSON escaping happens outside the lock, so a large text does not hold up
+        // the other connections.
         let frame = ToHost::ClientText { client_id, text }.encode();
         if let Some(host) = &self.lock().host {
             host.peer.send(frame);
+        }
+    }
+
+    /// Text from the [`LocalHost`] to one of its clients.
+    #[cfg_attr(not(feature = "host"), allow(dead_code, reason = "used by host mode"))]
+    pub(crate) fn send_to_client(&self, client_id: &str, text: Bytes) {
+        if let Some(client) = self.lock().clients.get(client_id).filter(|client| client.local) {
+            client.peer.send(text);
+        }
+    }
+
+    /// Text from the [`LocalHost`] to all of its clients.
+    #[cfg_attr(not(feature = "host"), allow(dead_code, reason = "used by host mode"))]
+    pub(crate) fn broadcast_local(&self, text: &Bytes) {
+        for client in self.lock().clients.values().filter(|client| client.local) {
+            client.peer.send(text.clone());
+        }
+    }
+
+    /// The [`LocalHost`] closes one of its clients.
+    #[cfg_attr(not(feature = "host"), allow(dead_code, reason = "used by host mode"))]
+    pub(crate) fn close_local_client(&self, client_id: &str) {
+        if let Some(client) = self.lock().clients.get(client_id).filter(|client| client.local) {
+            client.peer.close();
         }
     }
 
@@ -210,21 +300,23 @@ impl Shared {
         match frame.kind.as_deref() {
             Some("network") => {
                 let enabled = frame.enabled.is_some_and(json::is_true);
-                let Some(reply) = self.set_network(enabled).await else { return };
+                // In host mode the relay decides the network; a browser host only hears how it is.
+                let reply = if self.local.get().is_some() { Some(self.network_state()) } else { self.set_network(enabled).await };
+                let Some(reply) = reply else { return };
                 if let Some(host) = self.lock().host.as_ref().filter(|host| host.id == host_id) {
                     host.peer.send(reply);
                 }
             }
             Some("broadcast") => {
                 let payload = text_of(frame.text);
-                for client in self.lock().clients.values() {
+                for client in self.lock().clients.values().filter(|client| !client.local) {
                     client.peer.send(payload.clone());
                 }
             }
             Some(kind @ ("send" | "close")) => {
                 let Some(client_id) = frame.client_id.and_then(json::as_str) else { return };
                 let payload = (kind == "send").then(|| text_of(frame.text));
-                if let Some(client) = self.lock().clients.get(client_id.as_ref()) {
+                if let Some(client) = self.lock().clients.get(client_id.as_ref()).filter(|client| !client.local) {
                     match payload {
                         Some(payload) => client.peer.send(payload),
                         None => client.peer.close(),
@@ -246,11 +338,16 @@ impl Shared {
                         return;
                     }
                     state.host = None;
-                    for (_, client) in state.clients.drain() {
-                        client.peer.close();
-                    }
+                    // A browser host takes only its own clients with it.
+                    state.clients.retain(|_, client| {
+                        if !client.local {
+                            client.peer.close();
+                        }
+                        client.local
+                    });
                     drop(state);
-                    self.listener.get().is_some_and(Listener::network)
+                    self.browser.send_replace(None);
+                    self.local.get().is_none() && self.listener.get().is_some_and(Listener::network)
                 };
                 // Losing the host returns the relay to this computer.
                 if network {
@@ -263,12 +360,33 @@ impl Shared {
     /// A client is gone. The host hears of it once, if the client was still known.
     pub(crate) fn close_client(&self, client_id: &str) {
         let mut state = self.lock();
-        if state.clients.remove(client_id).is_none() {
+        let Some((id, client)) = state.clients.remove_entry(client_id) else { return };
+        if !client.local {
+            if let Some(host) = &state.host {
+                host.peer.send(ToHost::ClientClose { client_id }.encode());
+            }
             return;
         }
-        if let Some(host) = &state.host {
-            host.peer.send(ToHost::ClientClose { client_id }.encode());
+        drop(state);
+        if let Some(local) = self.local.get() {
+            local.closed(&id);
         }
+    }
+
+    /// Switches the network from this side (host mode's `--network`). Returns the reason
+    /// it could not, or `None` once it listens as asked.
+    #[cfg_attr(not(feature = "host"), allow(dead_code, reason = "used by host mode"))]
+    pub(crate) async fn switch_network(&self, enabled: bool) -> Option<String> {
+        let Some(reply) = self.set_network(enabled).await else { return Some("the relay is no longer listening".into()) };
+        let reply: serde_json::Value = serde_json::from_slice(&reply).ok()?;
+        reply.get("error").and_then(serde_json::Value::as_str).map(str::to_owned)
+    }
+
+    /// The `network` frame for how the relay listens now, without switching.
+    fn network_state(&self) -> Bytes {
+        let enabled = self.listener.get().is_some_and(Listener::network);
+        let addresses = if enabled { net::local_addresses() } else { Vec::new() };
+        ToHost::Network { enabled, addresses, error: None }.encode()
     }
 
     /// Rebinds to every interface or to this computer only, and answers the host's
@@ -332,6 +450,13 @@ impl Shared {
     }
 
     /// Closes every connection (shutdown).
+    /// Tells the [`LocalHost`], if any, that the relay is shutting down.
+    pub(crate) fn shutdown_local(&self) {
+        if let Some(local) = self.local.get() {
+            local.shutdown();
+        }
+    }
+
     pub(crate) fn close_all(&self) {
         let mut state = self.lock();
         if let Some(host) = state.host.take() {
@@ -345,7 +470,9 @@ impl Shared {
 
 /// Binds and starts everything a [`Builder`] describes.
 pub(crate) fn start(builder: Builder) -> Result<Relay, Error> {
-    let Builder { port, api_port, ping_interval, lookup_timeout, chunk_timeout, version, limits } = builder;
+    #[cfg(feature = "host")]
+    let host = builder.host.clone();
+    let Builder { port, api_port, ping_interval, lookup_timeout, chunk_timeout, version, limits, .. } = builder;
     let bind_error = |source| Error::Bind { port, source };
     let listener = net::bind(net::listen_address(false, port)).map_err(bind_error)?;
     let port = listener.local_addr().map_err(bind_error)?.port();
@@ -361,6 +488,13 @@ pub(crate) fn start(builder: Builder) -> Result<Relay, Error> {
     };
     let relay_listener = Listener::spawn(listener, handler, stop.clone()).map_err(bind_error)?;
     let _ = shared.listener.set(relay_listener);
+    #[cfg(feature = "host")]
+    if let Some(host) = &host
+        && let Err(source) = crate::host::start(&shared, host, &version, lookup_timeout, chunk_timeout, stop.clone())
+    {
+        shutdown.send_replace(true);
+        return Err(Error::Data { path: host.data_dir.clone(), source });
+    }
 
     let api = match api_port {
         None => ApiStatus::Disabled,

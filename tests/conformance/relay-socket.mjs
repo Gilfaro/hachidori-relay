@@ -150,8 +150,8 @@ export async function connectClient(t, port, path, origin = EXTENSION_ORIGIN, ho
       while (frame.opcode !== 0xA) frame = await frames.next("a pong frame");
       assert.equal(frame.payload.toString("utf8"), text);
     },
-    async json(what = "a frame") {
-      const frame = await frames.next(what);
+    async json(what = "a frame", timeoutMs = undefined) {
+      const frame = await frames.next(what, timeoutMs);
       assert.equal(frame.opcode, 0x1, `expected a text frame, got opcode ${frame.opcode}`);
       return JSON.parse(frame.payload.toString("utf8"));
     },

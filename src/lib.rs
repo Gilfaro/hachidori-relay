@@ -32,6 +32,8 @@
 //! tokio runtime, which must have the time and I/O drivers enabled.
 
 mod api;
+#[cfg(feature = "host")]
+mod host;
 mod json;
 mod listener;
 mod net;
@@ -44,6 +46,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::watch;
+
+#[cfg(feature = "host")]
+pub use host::HostOptions;
 
 /// The relay's default WebSocket port, the one Hachidori's Sharing uses.
 pub const DEFAULT_PORT: u16 = 8771;
@@ -96,6 +101,8 @@ pub struct Builder {
     chunk_timeout: Duration,
     version: String,
     limits: Limits,
+    #[cfg(feature = "host")]
+    host: Option<HostOptions>,
 }
 
 impl Default for Builder {
@@ -108,6 +115,8 @@ impl Default for Builder {
             chunk_timeout: DEFAULT_CHUNK_TIMEOUT,
             version: env!("CARGO_PKG_VERSION").to_owned(),
             limits: Limits::default(),
+            #[cfg(feature = "host")]
+            host: None,
         }
     }
 }
@@ -156,6 +165,15 @@ impl Builder {
         self
     }
 
+    /// Host mode (`host` feature): the relay is itself the sharing Hachidori, and a
+    /// browser connecting on `/host` is only a source it mirrors. `None` (the default)
+    /// keeps the plain relay. See [`HostOptions`].
+    #[cfg(feature = "host")]
+    pub fn host(mut self, options: Option<HostOptions>) -> Self {
+        self.host = options;
+        self
+    }
+
     /// Binds the relay on `127.0.0.1` and, if one is configured, the API port.
     /// Both listeners then run as tasks on the current tokio runtime.
     ///
@@ -165,7 +183,8 @@ impl Builder {
     ///
     /// # Errors
     ///
-    /// [`Error::Bind`] when the relay port cannot be bound. An API port that cannot
+    /// [`Error::Bind`] when the relay port cannot be bound, and [`Error::Data`] when host
+    /// mode cannot open its data directory. An API port that cannot
     /// be bound does not fail the start: the relay runs without the API, and
     /// [`Relay::api`] reports why.
     pub fn start(self) -> Result<Relay, Error> {
@@ -201,6 +220,15 @@ pub enum Error {
     /// no longer listening.
     #[error("the relay could not listen on this computer again: {0}")]
     Relisten(#[source] Arc<io::Error>),
+    /// Host mode could not open its data directory.
+    #[error("could not use the data directory {path}: {source}")]
+    Data {
+        /// The directory.
+        path: std::path::PathBuf,
+        /// The reason.
+        #[source]
+        source: io::Error,
+    },
 }
 
 /// A running relay. Dropping it does not stop the tasks; call [`Relay::shutdown`].
@@ -257,6 +285,7 @@ impl Relay {
         self.shared.close_all();
         // Give the connection tasks a moment to send their close frames.
         tokio::task::yield_now().await;
+        self.shared.shutdown_local();
     }
 }
 

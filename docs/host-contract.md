@@ -4,7 +4,7 @@
 
 > **This Rust reimplementation.** The contract is unchanged, with two differences
 > in what the relay reports. It reports its own version: `hello.version` is
-> `hachidori-relay/<crate version>` (0.1.0 now), and `/serverVersion` answers that
+> `hachidori-relay/<crate version>` (0.2.0 now), and `/serverVersion` answers that
 > crate version, where the text below says `0.0.6`. Replies are compact JSON: same
 > meaning, different spacing. Vendored from bee-san/hachidori-anki at e614794. The
 > fake host mentioned below lives in `tests/conformance/fake-host.mjs` here.

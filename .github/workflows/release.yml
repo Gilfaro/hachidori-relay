@@ -25,9 +25,17 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
             binary: hachidori-relay
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            binary: hachidori-relay
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            binary: hachidori-relay
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
