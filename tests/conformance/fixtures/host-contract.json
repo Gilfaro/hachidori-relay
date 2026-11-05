@@ -2,7 +2,7 @@
   "hello": {
     "kind": "hello",
     "protocol": 1,
-    "version": "hachidori-relay/0.2.0",
+    "version": "hachidori-relay/0.3.0",
     "name": "Hachidori Relay API",
     "capabilities": ["hoshidicts-api-v1"]
   },
