@@ -215,6 +215,14 @@ test("a stalled peer leaves healthy requests and pings responsive, then receives
   assert.ok(last.text === text, "the queued large UTF-8 frame arrives intact after the broadcast");
 });
 
+// Not in upstream: a deadline per step. The relay's 50 ms pings restart every frame
+// wait, so without this a missing event only shows as the whole test timing out.
+function within(what, promise, ms = 8000) {
+  let timer;
+  const deadline = new Promise((_, rejectLate) => { timer = setTimeout(() => rejectLate(new Error(`timed out: ${what}`)), ms); });
+  return Promise.race([promise, deadline]).finally(() => clearTimeout(timer));
+}
+
 test("network disable and host loss interrupt stalled sends and release their connections", { timeout: 20000 }, async (t) => {
   const { port } = await server(t);
   const host = await connectClient(t, port, "/host");
@@ -229,25 +237,25 @@ test("network disable and host loss interrupt stalled sends and release their co
   const text = largeReply();
   sendReply(host, remoteId, { kind: "large", text });
   host.send(JSON.stringify({ kind: "network", enabled: false }));
-  assert.equal((await untilKind(host, "network")).enabled, false);
-  assert.equal((await untilKind(host, "client-close")).clientId, remoteId);
+  assert.equal((await within("network off", untilKind(host, "network"))).enabled, false);
+  assert.equal((await within("the remote client-close", untilKind(host, "client-close"))).clientId, remoteId);
   remote.resume();
-  await remote.closed;
+  await within("the remote socket to close", remote.closed);
   healthy.send("still local");
-  assert.equal((await untilKind(host, "client-text")).text, "still local");
-  await assert.rejects(connectClient(t, port, "/link", EXTENSION_ORIGIN, address), /ECONNREFUSED/u);
+  assert.equal((await within("the local text", untilKind(host, "client-text"))).text, "still local");
+  await within("the network address to refuse", assert.rejects(connectClient(t, port, "/link", EXTENSION_ORIGIN, address), /ECONNREFUSED/u));
 
   const slow = await connectClient(t, port, "/link");
   const { clientId: slowId } = await untilKind(host, "client-open");
   slow.pause();
   sendReply(host, slowId, { kind: "large", text });
   host.send(JSON.stringify({ kind: "network", enabled: false }));
-  await untilKind(host, "network");
+  await within("the second network off", untilKind(host, "network"));
   host.destroy();
-  await healthy.closeFrame();
-  await healthy.closed;
+  await within("the healthy close frame", healthy.closeFrame());
+  await within("the healthy socket to close", healthy.closed);
   slow.resume();
-  await slow.closed;
+  await within("the slow socket to close", slow.closed);
   const next = await connectClient(t, port, "/host");
   assert.deepEqual(await next.json(), listening(port), "host loss releases the host slot too");
 });
