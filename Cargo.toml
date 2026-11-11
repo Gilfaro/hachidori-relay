@@ -2,7 +2,7 @@
 name = "hachidori-relay"
 version = "0.4.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.99"
 license = "GPL-3.0-or-later"
 description = "Standalone Rust reimplementation of the Hachidori sharing relay and its Yomitan-compatible HTTP API"
 readme = "README.md"

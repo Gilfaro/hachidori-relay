@@ -233,7 +233,9 @@ const mined = (expression, reading, generation, fields = {}) => ({
 });
 // A glossary nested past serde_json's default limit (128) but within what jsdom's
 // recursive serialiser can stand in for a browser's: the extension has a node
-// limit and no depth limit (deeper cases: glossary.rs tests).
+// limit and no depth limit (deeper cases: glossary.rs tests). 600 levels
+// overflowed the extension's side on CI's Linux runners (Node 22), so this
+// keeps twice serde's limit and a wide margin under jsdom's.
 const nested = (depth) => {
   let content = ["before <&>", { tag: "p", content: "paragraph" }, { tag: "a", href: "https://example.com/", content: "link" }, " after"];
   for (let level = 0; level < depth; level += 1) content = { tag: level % 2 ? "span" : "div", style: { marginLeft: "1px" }, content };
@@ -248,7 +250,7 @@ const submit = (expression, reading, fields = {}, clientMedia = {}) => (side) =>
 });
 const deepPreflight = (side) => {
   const message = preflight("鱈", "たら")(side);
-  message.request.term = { ...message.request.term, ...nested(600) };
+  message.request.term = { ...message.request.term, ...nested(256) };
   return message;
 };
 const SHOT = { token: "shot-1", filename: "hachidori-screenshot-0f8fad5b-d9cb-469f-a165-70867728950e.jpg" };

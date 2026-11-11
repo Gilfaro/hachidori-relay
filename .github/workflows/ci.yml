@@ -20,7 +20,7 @@ jobs:
         os: [windows-latest, ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
@@ -34,9 +34,9 @@ jobs:
         run: |
           echo "CC=gcc-14" >> "$GITHUB_ENV"
           echo "CXX=g++-14" >> "$GITHUB_ENV"
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
-          node-version: 22
+          node-version: 24
       - name: fmt
         run: cargo fmt --all --check
       - name: clippy (all features)
@@ -59,10 +59,10 @@ jobs:
       HACHIDORI_COMMIT: d41c37abe4ea54ef6ec885e9517bbf5655f3d718
       HACHIDORI_ORACLES: required
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           repository: bee-san/hachidori
           ref: ${{ env.HACHIDORI_COMMIT }}
@@ -73,9 +73,9 @@ jobs:
         run: |
           echo "CC=gcc-14" >> "$GITHUB_ENV"
           echo "CXX=g++-14" >> "$GITHUB_ENV"
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
-          node-version: 22
+          node-version: 24
       - name: Hachidori test tooling and fixtures
         working-directory: .hachidori
         run: |
@@ -94,13 +94,13 @@ jobs:
           tests/conformance/profiles-oracle.test.mjs tests/conformance/sharing-oracle.test.mjs
 
   msrv:
-    name: MSRV (1.88)
+    name: MSRV (1.99)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
-      - uses: dtolnay/rust-toolchain@1.88
+      - uses: dtolnay/rust-toolchain@1.99
       - uses: Swatinem/rust-cache@v2
       # Hoshidicts is C++23 and uses std::ranges::to, which needs GCC 14; Ubuntu 24.04
       # defaults to GCC 13 but has 14 preinstalled.
@@ -114,7 +114,7 @@ jobs:
   audit:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
       - uses: taiki-e/install-action@v2

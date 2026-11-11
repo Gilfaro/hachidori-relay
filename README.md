@@ -120,7 +120,7 @@ cargo build --release      # target/release/hachidori-relay
 cargo build --release --features host   # with host mode
 ```
 
-Rust 1.88 or later, x86_64 Windows (MSVC or GNU) or Linux.
+Rust 1.99 or later, x86_64 Windows (MSVC or GNU) or Linux.
 
 ## Testing
 
