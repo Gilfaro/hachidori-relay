@@ -8,7 +8,7 @@ import assert from "node:assert/strict";
 import { connect } from "node:net";
 import test from "node:test";
 import { startAnkiRelayServer } from "./anki-relay-server.mjs";
-import { EXTENSION_ORIGIN, connectClient, untilKind } from "./relay-socket.mjs";
+import { EXTENSION_ORIGIN, SLOW_TEST, connectClient, connectHost, untilKind } from "./relay-socket.mjs";
 
 async function relay(t, { handshake, message, queued } = {}) {
   const extraArgs = [];
@@ -21,9 +21,8 @@ async function relay(t, { handshake, message, queued } = {}) {
 }
 
 async function host(t, port) {
-  const socket = await connectClient(t, port, "/host");
-  assert.equal(socket.status, 101);
-  assert.equal((await untilKind(socket, "listening")).port, port);
+  const socket = await connectHost(t, port);
+  assert.equal(socket.listening.port, port);
   return socket;
 }
 
@@ -161,7 +160,7 @@ test("a queue just under the limit is delivered whole once the client reads", as
 });
 
 for (const mebibytes of [32, ...(process.env.HACHIDORI_STRESS ? [128] : [])]) {
-  test(`the default limits do not trip on ${mebibytes} MiB messages`, { timeout: 180_000 }, async (t) => {
+  test(`the default limits do not trip on ${mebibytes} MiB messages`, SLOW_TEST, async (t) => {
     const { port } = await relay(t);
     const hostSocket = await host(t, port);
     const client = await link(t, port, hostSocket);
@@ -171,18 +170,18 @@ for (const mebibytes of [32, ...(process.env.HACHIDORI_STRESS ? [128] : [])]) {
     const bytes = Buffer.byteLength(big);
 
     client.socket.sendRaw(frame(0x1, true, Buffer.from(big)));
-    assert.equal(Buffer.byteLength((await untilKind(hostSocket, "client-text")).text), bytes);
+    assert.equal(Buffer.byteLength((await untilKind(hostSocket, "client-text", SLOW_TEST.timeout)).text), bytes);
 
     const reply = JSON.stringify({ kind: "reply", text: big });
     for (const clientId of [client.id, paused.id]) {
       hostSocket.sendRaw(frame(0x1, true, Buffer.from(JSON.stringify({ kind: "send", clientId, text: reply }))));
     }
     hostSocket.send(JSON.stringify({ kind: "broadcast", text: "{\"kind\":\"marker\"}" }));
-    assert.equal(Buffer.byteLength((await untilKind(client.socket, "reply")).text), bytes);
+    assert.equal(Buffer.byteLength((await untilKind(client.socket, "reply", SLOW_TEST.timeout)).text), bytes);
     await untilKind(client.socket, "marker");
     // The paused client reads only now, after everything was queued for it.
     paused.socket.resume();
-    assert.equal(Buffer.byteLength((await untilKind(paused.socket, "reply")).text), bytes);
+    assert.equal(Buffer.byteLength((await untilKind(paused.socket, "reply", SLOW_TEST.timeout)).text), bytes);
     await untilKind(paused.socket, "marker");
 
     client.socket.send("after");

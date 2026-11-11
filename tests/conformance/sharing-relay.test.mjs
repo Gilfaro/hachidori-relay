@@ -4,7 +4,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { startAnkiRelayServer } from "./anki-relay-server.mjs";
-import { EXTENSION_ORIGIN, FIREFOX_ORIGIN, HOSHIDICTS_ORIGIN, connectClient, untilKind } from "./relay-socket.mjs";
+import { EXTENSION_ORIGIN, FIREFOX_ORIGIN, HOSHIDICTS_ORIGIN, SLOW_TEST, connectClient, connectHost, eventually, untilKind } from "./relay-socket.mjs";
 
 async function server(t) {
   const started = await startAnkiRelayServer({ pingMs: 50 });
@@ -19,8 +19,8 @@ test("the relay survives idle accept timeouts before and after a host connects",
   t.after(() => relay.close());
   await new Promise(resolveWait => setTimeout(resolveWait, 1500));
   assert.equal(relay.exitCode, null, "an idle listener must stay alive");
-  const host = await connectClient(t, relay.port, "/host");
-  assert.deepEqual(await host.json(), listening(relay.port));
+  const host = await connectHost(t, relay.port);
+  assert.deepEqual(host.listening, listening(relay.port));
   await new Promise(resolveWait => setTimeout(resolveWait, 1500));
   assert.equal(relay.exitCode, null, "an idle host must not shut the listener down");
   const client = await connectClient(t, relay.port, "/link");
@@ -34,9 +34,8 @@ test("clients are refused until a host connects, and a second host is turned awa
   assert.equal((await connectClient(t, port, "/host", "https://example.com")).status, 403);
   assert.equal((await connectClient(t, port, "/host", null)).status, 403);
   assert.equal((await connectClient(t, port, "/elsewhere")).status, 404);
-  const host = await connectClient(t, port, "/host");
-  assert.equal(host.status, 101);
-  assert.deepEqual(await host.json(), listening(port));
+  const host = await connectHost(t, port);
+  assert.deepEqual(host.listening, listening(port));
   const second = await connectClient(t, port, "/host");
   assert.equal(second.status, 101);
   assert.deepEqual(await second.json(), { kind: "listen-failed", error: "Another browser on this computer is already sharing through Anki." });
@@ -49,9 +48,8 @@ test("clients are refused until a host connects, and a second host is turned awa
 
 test("Hachidori for Firefox may host and link like Hachidori for Chrome", async (t) => {
   const { port } = await server(t);
-  const host = await connectClient(t, port, "/host", FIREFOX_ORIGIN);
-  assert.equal(host.status, 101);
-  assert.deepEqual(await host.json(), listening(port));
+  const host = await connectHost(t, port, FIREFOX_ORIGIN);
+  assert.deepEqual(host.listening, listening(port));
   const chrome = await connectClient(t, port, "/link", EXTENSION_ORIGIN);
   assert.equal(chrome.status, 101);
   assert.equal((await untilKind(host, "client-open")).origin, EXTENSION_ORIGIN);
@@ -68,8 +66,7 @@ test("the Hoshidicts app origin is admitted only on the client endpoint", async 
   assert.equal((await connectClient(t, port, "/link", HOSHIDICTS_ORIGIN)).status, 503, "host availability still gates native clients");
   assert.equal((await connectClient(t, port, "/host", HOSHIDICTS_ORIGIN)).status, 403, "native apps cannot become hosts");
   assert.equal((await connectClient(t, port, "/host", "hoshi://hoshidicts.evil")).status, 403);
-  const host = await connectClient(t, port, "/host");
-  await host.json();
+  const host = await connectHost(t, port);
   for (const origin of ["https://hoshidicts", "http://hoshidicts", "app://mangatan", "hoshi://mangatan", "hoshi://hoshidicts.evil", null]) {
     assert.equal((await connectClient(t, port, "/link", origin)).status, 403, `${origin} must not enter the native-client allowlist`);
   }
@@ -80,8 +77,7 @@ test("the Hoshidicts app origin is admitted only on the client endpoint", async 
 
 test("text crosses the relay whole in both directions, with pings on both sides", async (t) => {
   const { port } = await server(t);
-  const host = await connectClient(t, port, "/host");
-  await host.json();
+  const host = await connectHost(t, port);
   const first = await connectClient(t, port, "/link");
   const { clientId } = await untilKind(host, "client-open");
   const large = "大きな".repeat(Math.ceil(1.5 * 1024 * 1024 / 3));
@@ -109,16 +105,15 @@ test("text crosses the relay whole in both directions, with pings on both sides"
 
 test("losing the host closes its clients, and the next host is accepted", async (t) => {
   const { port } = await server(t);
-  const host = await connectClient(t, port, "/host");
-  await host.json();
+  const host = await connectHost(t, port);
   const client = await connectClient(t, port, "/link");
   await untilKind(host, "client-open");
   host.destroy();
   await client.closeFrame();
   await client.closed;
   assert.equal((await connectClient(t, port, "/link")).status, 503, "the lost host is forgotten");
-  const next = await connectClient(t, port, "/host");
-  assert.deepEqual(await next.json(), listening(port));
+  const next = await connectHost(t, port);
+  assert.deepEqual(next.listening, listening(port));
 });
 
 // The relay listens on this computer alone until the host asks for the network.
@@ -138,8 +133,8 @@ async function networkOn(t, host) {
 
 test("the host opens the relay to the network and closes it again", async (t) => {
   const { port } = await server(t);
-  const host = await connectClient(t, port, "/host");
-  assert.deepEqual(await host.json(), listening(port));
+  const host = await connectHost(t, port);
+  assert.deepEqual(host.listening, listening(port));
   const address = await networkOn(t, host);
   if (address === null) return;
   assert.equal((await connectClient(t, port, "/host", EXTENSION_ORIGIN, address)).status, 403, "only this computer's Hachidori hosts");
@@ -163,18 +158,16 @@ test("the host opens the relay to the network and closes it again", async (t) =>
 
 test("losing the host returns the relay to this computer", async (t) => {
   const { port } = await server(t);
-  const host = await connectClient(t, port, "/host");
-  await host.json();
+  const host = await connectHost(t, port);
   const address = await networkOn(t, host);
   if (address === null) return;
   host.send(JSON.stringify({ kind: "network", enabled: true }));
   assert.equal((await untilKind(host, "network")).enabled, true);
   assert.equal((await connectClient(t, port, "/link", EXTENSION_ORIGIN, address)).status, 101);
   host.destroy();
-  await new Promise((resolveWait) => setTimeout(resolveWait, 200));
-  await assert.rejects(connectClient(t, port, "/link", EXTENSION_ORIGIN, address), /ECONNREFUSED/u);
-  const next = await connectClient(t, port, "/host");
-  assert.deepEqual(await next.json(), listening(port));
+  await eventually("the relay leaving the network", () => assert.rejects(connectClient(t, port, "/link", EXTENSION_ORIGIN, address), /ECONNREFUSED/u));
+  const next = await connectHost(t, port);
+  assert.deepEqual(next.listening, listening(port));
 });
 
 // Larger than the TCP buffers while a peer is paused, using real sockets.
@@ -183,10 +176,9 @@ function sendReply(host, clientId, reply) {
   host.send(JSON.stringify({ kind: "send", clientId, text: JSON.stringify(reply) }));
 }
 
-test("a stalled peer leaves healthy requests and pings responsive, then receives large frames in order", { timeout: 20000 }, async (t) => {
+test("a stalled peer leaves healthy requests and pings responsive, then receives large frames in order", SLOW_TEST, async (t) => {
   const { port } = await server(t);
-  const host = await connectClient(t, port, "/host");
-  await host.json();
+  const host = await connectHost(t, port);
   const slow = await connectClient(t, port, "/link");
   const { clientId: slowId } = await untilKind(host, "client-open");
   const healthy = await connectClient(t, port, "/link");
@@ -215,18 +207,9 @@ test("a stalled peer leaves healthy requests and pings responsive, then receives
   assert.ok(last.text === text, "the queued large UTF-8 frame arrives intact after the broadcast");
 });
 
-// Not in upstream: a deadline per step. The relay's 50 ms pings restart every frame
-// wait, so without this a missing event only shows as the whole test timing out.
-function within(what, promise, ms = 8000) {
-  let timer;
-  const deadline = new Promise((_, rejectLate) => { timer = setTimeout(() => rejectLate(new Error(`timed out: ${what}`)), ms); });
-  return Promise.race([promise, deadline]).finally(() => clearTimeout(timer));
-}
-
-test("network disable and host loss interrupt stalled sends and release their connections", { timeout: 20000 }, async (t) => {
+test("network disable and host loss interrupt stalled sends and release their connections", SLOW_TEST, async (t) => {
   const { port } = await server(t);
-  const host = await connectClient(t, port, "/host");
-  await host.json();
+  const host = await connectHost(t, port);
   const address = await networkOn(t, host);
   if (address === null) return;
   const remote = await connectClient(t, port, "/link", EXTENSION_ORIGIN, address);
@@ -237,25 +220,25 @@ test("network disable and host loss interrupt stalled sends and release their co
   const text = largeReply();
   sendReply(host, remoteId, { kind: "large", text });
   host.send(JSON.stringify({ kind: "network", enabled: false }));
-  assert.equal((await within("network off", untilKind(host, "network"))).enabled, false);
-  assert.equal((await within("the remote client-close", untilKind(host, "client-close"))).clientId, remoteId);
+  assert.equal((await untilKind(host, "network")).enabled, false);
+  assert.equal((await untilKind(host, "client-close")).clientId, remoteId);
   remote.resume();
-  await within("the remote socket to close", remote.closed);
+  await remote.closed;
   healthy.send("still local");
-  assert.equal((await within("the local text", untilKind(host, "client-text"))).text, "still local");
-  await within("the network address to refuse", assert.rejects(connectClient(t, port, "/link", EXTENSION_ORIGIN, address), /ECONNREFUSED/u));
+  assert.equal((await untilKind(host, "client-text")).text, "still local");
+  await assert.rejects(connectClient(t, port, "/link", EXTENSION_ORIGIN, address), /ECONNREFUSED/u);
 
   const slow = await connectClient(t, port, "/link");
   const { clientId: slowId } = await untilKind(host, "client-open");
   slow.pause();
   sendReply(host, slowId, { kind: "large", text });
   host.send(JSON.stringify({ kind: "network", enabled: false }));
-  await within("the second network off", untilKind(host, "network"));
+  await untilKind(host, "network");
   host.destroy();
-  await within("the healthy close frame", healthy.closeFrame());
-  await within("the healthy socket to close", healthy.closed);
+  await healthy.closeFrame();
+  await healthy.closed;
   slow.resume();
-  await within("the slow socket to close", slow.closed);
-  const next = await connectClient(t, port, "/host");
-  assert.deepEqual(await next.json(), listening(port), "host loss releases the host slot too");
+  await slow.closed;
+  const next = await connectHost(t, port);
+  assert.deepEqual(next.listening, listening(port), "host loss releases the host slot too");
 });

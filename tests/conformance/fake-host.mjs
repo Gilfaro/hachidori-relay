@@ -4,7 +4,7 @@
 // capability, delayed or failing replies, and large payloads.
 // SPDX-License-Identifier: GPL-3.0-or-later
 import { readFileSync } from "node:fs";
-import { EXTENSION_ORIGIN, connectClient, queue } from "./relay-socket.mjs";
+import { EXTENSION_ORIGIN, WAIT_MS, connectHost, queue } from "./relay-socket.mjs";
 
 export const FIXTURES = JSON.parse(readFileSync(new URL("./fixtures/host-contract.json", import.meta.url), "utf8"));
 export const CAPABILITY = "hoshidicts-api-v1";
@@ -86,8 +86,7 @@ export function defaultRespond(message, host) {
 
 // `respond(message, host, defaults)` may return a response, a Promise, or `undefined` for the default.
 export async function startFakeHost(t, port, options = {}) {
-  const socket = await connectClient(t, port, "/host", options.origin ?? EXTENSION_ORIGIN);
-  if (socket.status !== 101) throw new Error(`fake host refused with ${socket.status}`);
+  const socket = await connectHost(t, port, options.origin ?? EXTENSION_ORIGIN);
   const relayFrames = queue();
   const host = {
     socket,
@@ -110,7 +109,7 @@ export async function startFakeHost(t, port, options = {}) {
     hellos: [],
     requests: [],
     pongs: 0,
-    listening: null,
+    listening: socket.listening,
     relayFrames,
     send(clientId, frame) { socket.send(JSON.stringify({ kind: "send", clientId, text: JSON.stringify(frame) })); },
     broadcast(frame) { socket.send(JSON.stringify({ kind: "broadcast", text: JSON.stringify(frame) })); },
@@ -120,7 +119,7 @@ export async function startFakeHost(t, port, options = {}) {
       return relayFrames.next("a network reply");
     },
     // Resolves once `predicate(host)` holds, polling every 10 ms.
-    async until(predicate, what = "condition", timeoutMs = 5000) {
+    async until(predicate, what = "condition", timeoutMs = WAIT_MS) {
       const deadline = Date.now() + timeoutMs;
       while (!predicate(host)) {
         if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
@@ -129,7 +128,7 @@ export async function startFakeHost(t, port, options = {}) {
       return host;
     },
     destroy() { socket.destroy(); },
-    closed: socket.closed,
+    get closed() { return socket.closed; },
   };
 
   async function handleClientText(clientId, text) {
@@ -197,6 +196,5 @@ export async function startFakeHost(t, port, options = {}) {
         relayFrames.push(message);
     }
   });
-  await host.until((current) => current.listening !== null, "the listening frame");
   return host;
 }

@@ -20,8 +20,10 @@ mod duplicates;
 mod gateway;
 mod glossary;
 mod index;
+mod language;
 mod media;
 mod preflight;
+mod profile;
 mod setup;
 mod submit;
 mod templates;
@@ -37,20 +39,21 @@ use self::cache::Index;
 use self::gateway::{Discovery, Gateway, Result};
 use self::templates::Resolved;
 use super::engine::Engine;
+use super::engine::mutations::{coded, split_code};
 use super::js;
 use super::local::Publisher;
-use super::settings::{hex, options, worker};
+use super::settings::{hex, options, profile_worker, profiles, worker};
 
 /// `OPTIONS_KEY`.
 const OPTIONS_KEY: &str = "options";
 /// `CONFIG_CHANGED`.
 const CONFIG_CHANGED: &str = "Anki configuration changed. Refresh this result before adding a note.";
 const TEMPLATE_GONE: &str = "The selected Anki Template is no longer available.";
+/// `ANKI_DECK_UNSET`.
+const DECK_UNSET: &str = "Choose an available deck.";
 /// `LINKED_ANKI_REQUESTS`.
 pub(crate) const REQUESTS: [&str; 7] =
     ["hd_anki_status", "hd_anki_view", "hd_anki_preflight", "hd_anki_submit", "hd_anki_browse", "hd_anki_maturity", "hd_anki_word_status"];
-/// How long a discovered configuration answers status and preflight (GSM's cache).
-const CONFIGURATION_TTL_MS: f64 = 2000.0;
 /// `guiBrowse`'s deadline.
 const BROWSE_TIMEOUT_MS: u64 = 30_000;
 
@@ -88,8 +91,8 @@ pub(crate) struct Anki {
     engine: Arc<Engine>,
     gateway: Gateway,
     index: Index,
-    /// `configuration`'s cache: per Template, its JSON, expiry and result.
-    configured: Mutex<HashMap<String, (String, f64, Configured)>>,
+    /// `configuration`'s cache: per Template, its JSON and result.
+    configured: Mutex<HashMap<String, (String, Configured)>>,
     /// `linkedAnkiConfigPrefix`: a host start's prefix of the keys linked browsers see.
     linked_prefix: String,
     /// `mutations`: one note write at a time.
@@ -111,6 +114,17 @@ fn selected_template_id(value: &Map<String, Value>) -> std::result::Result<Optio
             Ok(Some(id.clone()))
         }
         _ => Err("malformed linked Anki Template".to_owned()),
+    }
+}
+
+/// `selectedProfileId`: the profile a linked request is for, when it names one.
+pub(crate) fn selected_profile_id(value: &Value) -> std::result::Result<Option<Value>, String> {
+    let Some(id) = value.get("profileId") else { return Ok(None) };
+    match id.as_str() {
+        Some(text) if !text.is_empty() && js::length(text) <= 256 && !text.chars().any(|c| c <= '\u{1f}' || c == '\u{7f}') => {
+            Ok(Some(id.clone()))
+        }
+        _ => Err("malformed linked profile".to_owned()),
     }
 }
 
@@ -136,6 +150,9 @@ fn allow(message: &Value) -> std::result::Result<Value, String> {
         return Err("unsupported linked Anki request".to_owned());
     }
     let mut base = json!({ "target": "hachidori-anki", "type": kind, "requestId": request_id(message) });
+    if let Some(id) = selected_profile_id(message)? {
+        base["profileId"] = id;
+    }
     let request = message.get("request");
     let term = |request: &mut Map<String, Value>| -> std::result::Result<(), String> {
         let term = selected_fields(request.get("term"), &["expression", "reading"])?;
@@ -179,8 +196,7 @@ fn allow(message: &Value) -> std::result::Result<Value, String> {
                 "audioSelection",
                 "dictionaryAliases",
                 "dictionaryIds",
-                // A profile's notes follow each dictionary's direction and target language; the
-                // relay's one profile has no language, so they change nothing here.
+                // A profile's notes follow each dictionary's direction and target language.
                 "dictionaryDirections",
                 "dictionaryTargetLanguages",
                 "frequencyDictionaries",
@@ -255,6 +271,11 @@ impl Anki {
         self.publisher.read(key)
     }
 
+    /// Every stored key with `prefix`.
+    pub(crate) fn keys_with(&self, prefix: &str) -> Vec<String> {
+        self.publisher.keys_with(prefix)
+    }
+
     /// `reconcileAnkiIndex`.
     pub(crate) fn reconcile(&self) {
         if let Some(anki) = self.arc() {
@@ -268,18 +289,40 @@ impl Anki {
         options_from(self.publisher.read(OPTIONS_KEY).as_ref())
     }
 
+    /// `readAnkiOptionsAndProfile`: the options of the profile an Anki request is
+    /// for (`ankiOptionsOf`; today's for one that names none, and a missing
+    /// profile refused with its `errorCode`), and that profile's `{language,
+    /// packSettings}` once the records have profiles (`ankiProfileOf`).
+    fn options_and_profile(&self, profile_id: Option<&str>) -> std::result::Result<(Map<String, Value>, Option<Value>), String> {
+        let stored = self.publisher.read(OPTIONS_KEY);
+        let options = match profile_id {
+            None => options_from(stored.as_ref()),
+            Some(id) => {
+                profile_worker::request_profile_id(&json!({ "profileId": id }), stored.as_ref()).map_err(|refused| match refused.code {
+                    Some(code) => coded(&refused.error, code),
+                    None => refused.error,
+                })?;
+                without_speech(profiles::project_options(stored.as_ref(), id, true))
+            }
+        };
+        let profile = profiles::has_profiles(stored.as_ref())
+            .then(|| profiles::profile_descriptor(stored.as_ref(), profile_id.unwrap_or(super::profile::JAPANESE)))
+            .flatten()
+            .map(|profile| json!({ "language": profile["language"], "packSettings": profile["packSettings"] }));
+        Ok((options, profile))
+    }
+
     fn index_state(&self) -> Option<Value> {
         self.publisher.read(cache::KEY)
     }
 
     /// `updateState`: one change of the stored index, given the options with it;
     /// returns what is stored afterwards.
-    fn update_index(&self, change: impl FnOnce(&Map<String, Value>, Option<&Value>) -> Option<Value>) -> Option<Value> {
+    fn update_index(&self, change: impl FnOnce(Option<&Value>, Option<&Value>) -> Option<Value>) -> Option<Value> {
         let mut saved = None;
         let result = self.publisher.publish_with(|storage| {
-            let options = options_from(storage.get(OPTIONS_KEY));
             let state = storage.get(cache::KEY);
-            let next = change(&options, state);
+            let next = change(storage.get(OPTIONS_KEY), state);
             let write = next.as_ref().filter(|next| !state.is_some_and(|state| js::same_json(state, next)));
             saved = next.clone().or_else(|| state.cloned());
             write.map(|next| Map::from_iter([(cache::KEY.to_owned(), next.clone())])).unwrap_or_default()
@@ -300,9 +343,18 @@ impl Anki {
         self.invoker(config.get("url"), config.get("apiKey").and_then(Value::as_str).unwrap_or_default())
     }
 
-    /// `readConfig`: the Template's configuration, with what else decides its notes.
-    fn read_config(options: &Map<String, Value>, template_id: Option<&Value>) -> Option<Map<String, Value>> {
-        let mut config = options::anki_template_config(options.get("anki"), template_id)?;
+    /// `readConfig`: the configuration of the Template `key` names (a Template
+    /// id, or a profile's Template key), in its profile's options and language.
+    fn read_config(&self, key: Option<&Value>) -> std::result::Result<Option<Map<String, Value>>, String> {
+        let (profile_id, template_id) = profile::template_target(key);
+        let (options, profile) = self.options_and_profile(profile_id.as_deref())?;
+        Ok(Self::config_from(&options, profile.as_ref(), template_id.as_ref()))
+    }
+
+    /// `readConfig`'s configuration from the profile's options.
+    fn config_from(options: &Map<String, Value>, profile: Option<&Value>, template_id: Option<&Value>) -> Option<Map<String, Value>> {
+        let template = options::anki_template_config(options.get("anki"), template_id)?;
+        let mut config = profile::in_language(template, profile);
         let sources: Vec<Value> = options
             .get("audioSources")
             .and_then(Value::as_array)
@@ -310,8 +362,18 @@ impl Anki {
             .unwrap_or_default();
         config.insert("audioSources".to_owned(), Value::Array(sources));
         config.insert("compactGlossary".to_owned(), json!(options.get("smallerAnkiCards") == Some(&Value::Bool(true))));
-        let netflix = options.get("experimental").and_then(|experimental| experimental.get("netflixMining"));
-        config.insert("netflixMining".to_owned(), json!(netflix == Some(&Value::Bool(true))));
+        // Part of the checked configuration, so toggling Compact popup and Anki
+        // between a preflight and Add refuses the stale Add.
+        config.insert("compactGlossaries".to_owned(), json!(options.get("glossaryLayoutMode") == Some(&json!("compact-popup-anki"))));
+        let experimental =
+            |flag: &str| options.get("experimental").and_then(|experimental| experimental.get(flag)) == Some(&Value::Bool(true));
+        config.insert("netflixMining".to_owned(), json!(experimental("netflixMining")));
+        config.insert("youtubeMining".to_owned(), json!(options.get("youtubeMining") == Some(&Value::Bool(true))));
+        config.insert("crunchyrollMining".to_owned(), json!(experimental("crunchyrollMining")));
+        // And the profile's language, which decides how the note is written.
+        if let Some(profile) = profile {
+            config.insert("profile".to_owned(), profile.clone());
+        }
         Some(config)
     }
 
@@ -323,20 +385,20 @@ impl Anki {
 
     /// `identity`.
     fn identity(&self, template_id: Option<&Value>) -> std::result::Result<(Map<String, Value>, String), String> {
-        let config = Self::read_config(&self.options(), template_id).ok_or(TEMPLATE_GONE)?;
+        let config = self.read_config(template_id)?.ok_or(TEMPLATE_GONE)?;
         let key = Self::config_key(template_id, &config);
         Ok((config, key))
     }
 
-    /// `configuration`: the Template checked against Anki, cached for two seconds.
-    fn configuration(&self, template_id: Option<&Value>, fresh: bool) -> std::result::Result<Configured, String> {
+    /// `configuration`: the Template checked against Anki. The result is kept while
+    /// the configuration is unchanged; Anki validates the destination again when
+    /// adding, and a configuration with errors, or a failure, retires it for a retry.
+    fn configuration(&self, template_id: Option<&Value>) -> std::result::Result<Configured, String> {
         let (config, config_key) = self.identity(template_id)?;
         let json = Value::Object(config.clone()).to_string();
-        let cache_key = template_id.and_then(Value::as_str).unwrap_or_default().to_owned();
-        if !fresh
-            && let Some((key, expires, configured)) = self.configured.lock().unwrap_or_else(PoisonError::into_inner).get(&cache_key)
+        let cache_key = Self::cache_key(template_id);
+        if let Some((key, configured)) = self.configured.lock().unwrap_or_else(PoisonError::into_inner).get(&cache_key)
             && *key == json
-            && js::now() < *expires
         {
             return Ok(configured.clone());
         }
@@ -354,11 +416,22 @@ impl Anki {
             let errors = gateway::availability(&config, Some(&discovery), Some(&resolved));
             Configured { config, config_key, discovery: Some(discovery), resolved: Some(resolved), errors }
         };
-        self.configured
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(cache_key, (json, js::now() + CONFIGURATION_TTL_MS, configured.clone()));
+        if configured.errors.is_empty() {
+            self.configured.lock().unwrap_or_else(PoisonError::into_inner).insert(cache_key, (json, configured.clone()));
+        } else {
+            self.retire(template_id);
+        }
         Ok(configured)
+    }
+
+    /// `cached`'s key: the Template id, or "".
+    fn cache_key(template_id: Option<&Value>) -> String {
+        template_id.and_then(Value::as_str).unwrap_or_default().to_owned()
+    }
+
+    /// `cached.delete`: the next request discovers the Template again.
+    fn retire(&self, template_id: Option<&Value>) {
+        self.configured.lock().unwrap_or_else(PoisonError::into_inner).remove(&Self::cache_key(template_id));
     }
 
     /// `hostLinkedAnkiRequest`: the request with the host's own configuration key.
@@ -375,14 +448,20 @@ impl Anki {
         format!("{}{key}", self.linked_prefix)
     }
 
-    /// `status`.
-    fn status(&self, template_id: Option<&Value>) -> std::result::Result<Map<String, Value>, String> {
-        let current = self.configuration(template_id, false)?;
-        Ok(object(json!({
+    /// `status`, as `singleProfileStatus` answers it: only a status that names
+    /// a profile says when nothing but a deck is missing (`emptyDeck`), which
+    /// opens Settings → Anki for a new profile's Templates.
+    fn status(&self, message: &Value) -> std::result::Result<Map<String, Value>, String> {
+        let current = self.configuration(message.get("templateId"))?;
+        let mut status = object(json!({
             "available": current.errors.is_empty(),
             "configKey": self.linked_key(&current.config_key),
             "error": current.errors.join("\n"),
-        })))
+        }));
+        if message.get("profileId").is_some() && current.errors == [DECK_UNSET] {
+            status.insert("emptyDeck".to_owned(), Value::Bool(true));
+        }
+        Ok(status)
     }
 
     /// `view`: what the index already knows of the term, without asking Anki.
@@ -411,7 +490,7 @@ impl Anki {
     /// `browse`: Anki's browser on the term's notes, repaired from Anki first.
     fn browse(&self, request: &Map<String, Value>) -> std::result::Result<Map<String, Value>, String> {
         let template_id = request.get("templateId");
-        let config = Self::read_config(&self.options(), template_id).ok_or(TEMPLATE_GONE)?;
+        let config = self.read_config(template_id)?.ok_or(TEMPLATE_GONE)?;
         if let Some(key) = request.get("configKey").and_then(Value::as_str)
             && key != Self::config_key(template_id, &config)
         {
@@ -422,8 +501,9 @@ impl Anki {
         let mut note_ids: Vec<Value> = supplied.cloned().unwrap_or_default();
         let mut repaired = false;
         let expression = request.get("expression").filter(|expression| expression.as_str().is_some_and(|text| !text.is_empty()));
-        if supplied.is_some()
-            && let Some(expression) = expression
+        // Any term the index can answer for is repaired, so View finds the notes of
+        // a duplicate the add check named without ids (Hachidori #683).
+        if let Some(expression) = expression
             && index::source(&config).is_some()
         {
             let found = self.index.find(self, &config, Some(expression), &invoke, true).map_err(|error| error.message)?;
@@ -444,12 +524,12 @@ impl Anki {
     }
 
     /// `maturity`: whether the term's cached row is mature, when definitions blur for it.
-    fn maturity(&self, request: &Value) -> Map<String, Value> {
-        let options = self.options();
+    fn maturity(&self, request: &Value) -> std::result::Result<Map<String, Value>, String> {
+        let (options, profile) = self.options_and_profile(profile::request_profile(request).as_deref())?;
         let blur = options.get("definitionBlurAnkiMature") == Some(&Value::Bool(true));
-        let anki = options.get("anki").and_then(Value::as_object).cloned().unwrap_or_default();
+        let anki = profile::in_language(options.get("anki").and_then(Value::as_object).cloned().unwrap_or_default(), profile.as_ref());
         let expression = request.get("term").and_then(|term| term.get("expression"));
-        object(json!({ "mature": blur && self.index.has(&anki, expression) }))
+        Ok(object(json!({ "mature": blur && self.index.has(&anki, expression) })))
     }
 
     /// `wordStatus`: the page's headwords from the first Template's cached rows.
@@ -459,23 +539,23 @@ impl Anki {
             .and_then(Value::as_array)
             .and_then(|headwords| headwords.iter().map(Value::as_str).collect::<Option<Vec<&str>>>())
             .ok_or("Word status requires an array of headwords.")?;
-        let options = self.options();
-        let anki = options.get("anki").and_then(Value::as_object).cloned().unwrap_or_default();
+        let (options, profile) = self.options_and_profile(profile::request_profile(request).as_deref())?;
+        let anki = profile::in_language(options.get("anki").and_then(Value::as_object).cloned().unwrap_or_default(), profile.as_ref());
         Ok(object(self.index.statuses(&anki, &headwords)))
     }
 
     /// `answerAnkiRequest` for a linked client: one `hachidori-anki` request.
     pub(crate) fn handle(&self, message: &Value) -> Value {
-        let allowed = match allow(message) {
+        let allowed = match allow(message).and_then(profile::with_anki_profile) {
             Ok(allowed) => allowed,
             Err(error) => return super::local::failure(message, &error),
         };
         let request = allowed.get("request").cloned().unwrap_or(Value::Null);
         let result = match allowed["type"].as_str().unwrap_or_default() {
-            "hd_anki_status" => self.status(allowed.get("templateId")),
+            "hd_anki_status" => self.status(&allowed),
             "hd_anki_view" => self.view(&request),
             "hd_anki_browse" => self.host_request(&request).and_then(|request| self.browse(&request)),
-            "hd_anki_maturity" => Ok(self.maturity(&request)),
+            "hd_anki_maturity" => self.maturity(&request),
             "hd_anki_word_status" => self.word_status(&request),
             "hd_anki_preflight" => self.host_request(&request).and_then(|request| self.preflight(&Value::Object(request))),
             "hd_anki_submit" => self
@@ -485,7 +565,7 @@ impl Anki {
         };
         match result {
             Ok(result) => reply(&allowed, result),
-            Err(error) => super::local::failure(&allowed, &error),
+            Err(error) => coded_failure(&allowed, &error),
         }
     }
 
@@ -501,17 +581,24 @@ impl Anki {
         reply(&allowed, self.gateway.discover(&config).to_json())
     }
 
-    /// `hd_anki_setup` from a linked Settings page: the selected Template checked.
+    /// `hd_anki_setup` from a linked Settings page: the selected Template of the
+    /// profile it names checked.
     pub(crate) fn setup(&self, message: &Value) -> Value {
-        let template_id = match message.as_object().map(selected_template_id).transpose() {
-            Ok(id) => id.flatten(),
+        let selected =
+            message.as_object().map(selected_template_id).transpose().and_then(|id| Ok((id.flatten(), selected_profile_id(message)?)));
+        let (template_id, profile_id) = match selected {
+            Ok(selected) => selected,
             Err(error) => return super::local::failure(message, &error),
         };
         let mut allowed = json!({ "target": "hoshidicts-worker", "type": "hd_anki_setup", "requestId": request_id(message) });
         if let Some(id) = &template_id {
             allowed["templateId"] = id.clone();
         }
-        let Some(config) = options::anki_template_config(self.options().get("anki"), template_id.as_ref()) else {
+        let options = match self.options_and_profile(profile_id.as_ref().and_then(Value::as_str)) {
+            Ok((options, _)) => options,
+            Err(error) => return coded_failure(message, &error),
+        };
+        let Some(config) = options::anki_template_config(options.get("anki"), template_id.as_ref()) else {
             return super::local::failure(message, TEMPLATE_GONE);
         };
         let invoke = self.config_invoker(&config);
@@ -523,9 +610,8 @@ impl Anki {
 /// that moves the duplicate index to another source also resets the stored index.
 pub(crate) fn derive_index(storage: &BTreeMap<String, Value>, changes: &mut Map<String, Value>) {
     let Some(next) = changes.get(OPTIONS_KEY) else { return };
-    let before = options::normalise(storage.get(OPTIONS_KEY));
-    let after = options::normalise(Some(next).filter(|next| !next.is_null()));
-    if let Some(index) = cache::configuration_change(&before, &after, storage.get(cache::KEY)) {
+    let after = Some(next).filter(|next| !next.is_null());
+    if let Some(index) = cache::configuration_change(storage.get(OPTIONS_KEY), after, storage.get(cache::KEY)) {
         changes.insert(cache::KEY.to_owned(), index);
     }
 }
@@ -548,11 +634,21 @@ pub(crate) fn word_status(previous: Option<&Value>, changes: &Map<String, Value>
 
 /// `normaliseOptions`, with `capabilityAnkiOptions`' browser speech filter.
 fn options_from(stored: Option<&Value>) -> Map<String, Value> {
-    let mut options = options::normalise(stored);
+    without_speech(options::normalise(stored))
+}
+
+/// `capabilityAnkiOptions`: no browser speech, which this host cannot put on a note.
+fn without_speech(mut options: Map<String, Value>) -> Map<String, Value> {
     if let Some(Value::Array(sources)) = options.get_mut("audioSources") {
         sources.retain(|source| !source.get("type").and_then(Value::as_str).is_some_and(|kind| kind.starts_with("text-to-speech")));
     }
     options
+}
+
+/// `failureReply`, with the `errorCode` an error was given ([`coded`]).
+fn coded_failure(message: &Value, error: &str) -> Value {
+    let (error, code) = split_code(error);
+    super::local::failure_with_code(message, error, code)
 }
 
 #[cfg(test)]

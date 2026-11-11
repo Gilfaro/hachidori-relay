@@ -12,8 +12,10 @@ import { createRequire, syncBuiltinESMExports } from "node:module";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import vm from "node:vm";
 import { relayBinary } from "./anki-relay-server.mjs";
-import { connectClient, untilKind } from "./relay-socket.mjs";
+import { connectHost, untilKind } from "./relay-socket.mjs";
+import { oracleSkip } from "./oracle-skip.mjs";
 
 // The extension fakes replace fetch; the HTTP API is reached with the real one.
 export const realFetch = globalThis.fetch;
@@ -27,7 +29,7 @@ const missing = [
   ...["extension/vendor/hoshidicts.wasm", ...FIXTURES.map((name) => `test/fixtures/${name}`)]
     .filter((path) => !existsSync(join(HACHIDORI, path))).map((path) => join(HACHIDORI, path)),
 ];
-export const skip = missing.length > 0 && `needs ${missing.join(", ")}`;
+export const skip = oracleSkip(missing);
 // jsdom, for the extension's Anki field rendering, where Hachidori's own tests look
 // for it; without it the oracles leave Anki rendering out.
 const JSDOM_PATHS = [process.env.HACHIDORI_JSDOM, join(HACHIDORI, "test/tooling"), join(homedir(), ".cache/hachidori-e2e")].filter(Boolean);
@@ -38,6 +40,9 @@ export const jsdomEntry = (() => {
     return null;
   }
 })();
+if (!jsdomEntry && !skip && process.env.HACHIDORI_ORACLES === "required") {
+  throw new Error("HACHIDORI_ORACLES=required, but jsdom is missing, so the oracles would leave Anki rendering out");
+}
 
 // The smoke fakes strip a module's imports with LF-only patterns, so a checkout with
 // CRLF line endings (Git for Windows' default) is read as LF.
@@ -51,21 +56,52 @@ function readSourcesAsLf() {
 }
 
 // The extension in Node, as test/extension-smoke/engine.mjs boots it.
-export async function bootExtension() {
+// `WebSocket` is what the background's sharing host connects to the relay with;
+// without one it never connects.
+export async function bootExtension({ WebSocket } = {}) {
   readSourcesAsLf();
   const fakes = await import(pathToFileURL(join(HACHIDORI, "test/extension-smoke/fakes.mjs")));
   fakes.installFakeIndexedDB();
   fakes.installFetch();
+  // The engine is imported from a file: URL, so it reads its language packs there.
+  const fakeFetch = globalThis.fetch;
+  globalThis.fetch = async (input) => {
+    const url = String(input);
+    if (!url.startsWith("file:")) return fakeFetch(input);
+    try {
+      const body = readFileSync(fileURLToPath(url), "utf8");
+      return { ok: true, status: 200, text: async () => body };
+    } catch {
+      return { ok: false, status: 404, text: async () => "" };
+    }
+  };
   fakes.installNavigator();
   const bus = fakes.makeBus();
   const storage = fakes.makeStorage();
   const alarms = fakes.makeAlarms();
   const offscreenChrome = fakes.makeChrome("offscreen", bus, storage, alarms);
   globalThis.chrome = offscreenChrome;
+  // The build's language registry, which the background and the engine read
+  // (extension/vendor/languages/registry.js); the smoke fakes leave it out.
+  const vendored = {};
+  vendored.globalThis = vendored;
+  vm.runInNewContext(readFileSync(join(HACHIDORI, "extension/vendor/languages/registry.js"), "utf8"), vendored);
+  globalThis.HDLanguages = vendored.HDLanguages;
+  // The background bundle leaves profile-state.js out; the extension's own
+  // profile tests hand its functions in (profiles.test.mjs).
+  const profileState = await import(pathToFileURL(join(HACHIDORI, "extension/profile-state.js")));
+  // So do the sharing host's language modules (sharing-profiles.test.mjs), which
+  // read this realm's registry above.
+  const sharingModules = await Promise.all(["japanese-view.js", "sharing-languages.js", "language-names.js"]
+    .map((name) => import(pathToFileURL(join(HACHIDORI, "extension", name)))));
   // The context's own intrinsics stay its own: with this realm's Error, an error V8
   // raises inside the worker is no `instanceof Error` there and is described as "{}".
-  fakes.loadBackgroundScript({
+  const context = fakes.loadBackgroundScript({
+    ...(WebSocket === undefined ? {} : { WebSocket }),
     chrome: fakes.makeChrome("sw", bus, storage, alarms), console, fetch: globalThis.fetch, setTimeout, clearTimeout, URL,
+    HDLanguages: vendored.HDLanguages,
+    ...Object.fromEntries(Object.entries(profileState).filter(([, value]) => typeof value === "function")),
+    ...Object.assign({}, ...sharingModules),
   });
   const service = await import(pathToFileURL(join(HACHIDORI, "extension/engine-service.js")));
   const { default: createHoshidicts } = await import(pathToFileURL(join(HACHIDORI, "extension/vendor/hoshidicts.mjs")));
@@ -91,8 +127,13 @@ export async function bootExtension() {
     "dictionaryUpdates", "lookupStats", "wordStatusOverrides"]);
   // The API host as background-sharing.js builds it, answering as dispatchSharedRequest does.
   const { createApiHost } = await import(pathToFileURL(join(HACHIDORI, "extension/api-host.js")));
+  // `sendAnkiRequest(TARGET, ...)`: lookups go through the background, which
+  // adds the profile's fields (upstream docs/languages.md 9.3).
+  const PROFILED = new Set(["hd_lookup", "hd_kanji", "hd_segment"]);
   const apiEngine = async (fields) => {
-    const reply = await engine({ ...fields, requestId: "api" });
+    const reply = PROFILED.has(fields.type)
+      ? await offscreenChrome.runtime.sendMessage({ target: "hoshidicts-offscreen", ...fields, requestId: "api" })
+      : await engine({ ...fields, requestId: "api" });
     if (!reply?.ok) throw new Error(reply?.error || "Anki preparation did not complete.");
     return reply;
   };
@@ -107,6 +148,7 @@ export async function bootExtension() {
       if (message.type === "hd_anki_audio") throw new Error("Browser text-to-speech recording is unavailable.");
       return buildAnkiResourceFields(message.request, message.templates, {
         document, dictionaryPaths: message.dictionaryPaths, audio: message.audio, compactGlossary: message.compactGlossary === true,
+        compactGlossaries: message.compactGlossaries === true, ...(message.profile ? { profile: message.profile } : {}),
         styles: async () => {
           const reply = await apiEngine({ type: "hd_styles" });
           if (reply.generation !== message.request.generation) throw new Error("Dictionary styles changed during Anki preparation.");
@@ -118,32 +160,73 @@ export async function bootExtension() {
   // `readAnkiOptions`, for a host without browser speech, as the relay is.
   await import(pathToFileURL(join(HACHIDORI, "extension/reader-options.js")));
   const { capabilityAnkiOptions } = await import(pathToFileURL(join(HACHIDORI, "extension/setup-state.js")));
-  const readOptions = async () => capabilityAnkiOptions(
-    globalThis.HDReaderOptions.normaliseOptions((await storage.api().local.get("options")).options),
-    { screenshot: true, browserSpeech: false });
+  // `ankiOptionsOf`, `ankiProfileOf`, `apiProfile` and `apiDictionaries` (background-anki.js,
+  // background-sharing.js) over this realm's records.
+  const layer = globalThis.HDReaderOptions;
+  const { personalDictionaryLanguage } = await import(pathToFileURL(join(HACHIDORI, "extension/custom-dictionary.js")));
+  const storedOptions = async () => (await storage.api().local.get("options")).options;
+  const readOptions = async (profileId) => {
+    const stored = await storedOptions();
+    return capabilityAnkiOptions(profileId === undefined ? layer.normaliseOptions(stored) : layer.projectOptions(stored, profileId),
+      { screenshot: true, browserSpeech: false });
+  };
+  const readProfile = async (profileId) => {
+    const stored = await storedOptions();
+    if (!layer.hasProfiles(stored)) return null;
+    const profile = layer.profileDescriptor(stored, profileId ?? layer.JAPANESE_PROFILE_ID);
+    return profile === null ? null : { language: profile.language, packSettings: profile.packSettings };
+  };
+  const resolveProfile = async (profileIndex) => {
+    const stored = await storedOptions();
+    if (!layer.hasProfiles(stored)) return profileIndex === 0 ? { profileId: undefined } : null;
+    const others = layer.profiles(stored).filter((profile) => profile.id !== layer.JAPANESE_PROFILE_ID);
+    if (profileIndex === 0) {
+      return layer.profiles(stored).some((profile) => profile.id === layer.JAPANESE_PROFILE_ID)
+        ? { profileId: layer.JAPANESE_PROFILE_ID } : { profileId: undefined };
+    }
+    const profile = others[profileIndex - 1];
+    return profile === undefined ? null : { profileId: profile.id };
+  };
+  const readDictionaries = async (profileId) => {
+    const { dictionaryState: state } = await storage.api().local.get("dictionaryState");
+    if (!layer.hasDictionaryProfiles(state)) return state?.dictionaries ?? [];
+    return (layer.projectDictionaryState(state, profileId ?? layer.JAPANESE_PROFILE_ID)?.dictionaries ?? [])
+      .filter((row) => [null, layer.JAPANESE_PROFILE_ID].includes(personalDictionaryLanguage(row)));
+  };
   const apiHost = createApiHost({
     version: "oracle",
     engine: apiEngine,
     render,
-    readDictionaries: async () => (await storage.api().local.get("dictionaryState")).dictionaryState?.dictionaries ?? [],
-    readAudioSources: async () => (await readOptions()).audioSources.filter((source) => source.enabled),
-    readAnkiTemplates: async () => (await readOptions()).anki.templates,
+    readDictionaries,
+    readAudioSources: async (profileId) => (await readOptions(profileId)).audioSources.filter((source) => source.enabled),
+    readAnkiTemplates: async (profileId) => (await readOptions(profileId)).anki.templates,
     readSmallerAnkiCards: async () => (await readOptions()).smallerAnkiCards,
+    readCompactGlossaries: async () => (await readOptions()).glossaryLayoutMode === "compact-popup-anki",
+    resolveProfile,
+    readProfile,
   });
   const api = (message) => apiHost(message).catch((error) => ({ type: `${message.type}_result`, requestId: message.requestId ?? null,
     ok: false, error: error.message, generation: 0 }));
   const { openBackupArchive } = await import(pathToFileURL(join(HACHIDORI, "extension/backup-archive.js")));
   const { assertBackupSnapshot } = await import(pathToFileURL(join(HACHIDORI, "extension/backup-state.js")));
-  return { engine, api, snapshot, storage, openBackupArchive, assertBackupSnapshot, createObjectURL: fakes.createObjectURL };
+  // A page's request, which the background relays to the engine with its profile's fields.
+  const page = (message) => offscreenChrome.runtime.sendMessage(message);
+  return { context, engine, page, api, snapshot, storage, openBackupArchive, assertBackupSnapshot, createObjectURL: fakes.createObjectURL };
 }
 
 // What may differ by design (docs/host-mode.md) between a reply or stored value of
 // the extension and of the relay: each side's own load counter and load path, the
-// new generations' random names (numbered in the order each side made them), upload
+// new generations' random names (numbered in the order each side made them), other
+// random ids, such as a new profile's Template ids (numbered the same way), upload
 // tokens, and the time each side imported a package.
 export function comparer() {
   const names = new Map();
+  const ids = new Map();
   const walk = (value) => {
+    if (typeof value === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u.test(value)) {
+      if (!ids.has(value)) ids.set(value, `id-${ids.size + 1}`);
+      return ids.get(value);
+    }
     if (typeof value === "string") {
       return value.replace(/\.hdw-generation-[0-9a-f-]{36}/gu, (name) => {
         if (!names.has(name)) names.set(name, `generation-${names.size + 1}`);
@@ -161,9 +244,7 @@ export function comparer() {
 // The extension as the relay's browser host: its hello, and its answers to the
 // relay's pull session (api-host.js' hd_api_dictionary_*, from the engine).
 export async function serveAsBrowserHost(t, port, { engine, snapshot }) {
-  const socket = await connectClient(t, port, "/host");
-  assert.equal(socket.status, 101);
-  await untilKind(socket, "listening");
+  const socket = await connectHost(t, port);
   const open = await untilKind(socket, "client-open");
   const says = (frame) => socket.send(JSON.stringify({ kind: "send", clientId: open.clientId, text: JSON.stringify(frame) }));
   const shapes = {

@@ -15,6 +15,7 @@
 //! - [`lookup`]: what the extension adds to the engine's replies (tags, furigana).
 //! - [`yomitan`]: the host side of the Yomitan-compatible API.
 //! - [`anki`]: Anki over AnkiConnect, and the duplicate index behind word status.
+//! - [`profile`]: the profile a request names, on records without profiles.
 //! - [`settings`]: the service worker's settings rules and storage requests.
 //! - [`js`]: JavaScript's semantics for the values those rules read.
 
@@ -36,9 +37,13 @@ mod engine;
 mod js;
 mod local;
 mod lookup;
+mod loopback;
+mod profile;
+mod registry;
 mod remote;
 mod settings;
 mod setup;
+mod sharing_languages;
 mod store;
 mod sync;
 #[cfg(test)]

@@ -12,9 +12,10 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import test from "node:test";
 import { startAnkiRelayServer } from "./anki-relay-server.mjs";
-import { FIXTURES, bootExtension, jsdomEntry, realFetch, serveAsBrowserHost, skip } from "./extension-host.mjs";
+import { FIXTURES, HACHIDORI, bootExtension, jsdomEntry, realFetch, serveAsBrowserHost, skip } from "./extension-host.mjs";
 import { connectClient, untilKind } from "./relay-socket.mjs";
 
 // What may differ between the two, by design (docs/host-mode.md): the generation
@@ -49,11 +50,16 @@ test("the relay's engine answers as the extension's own engine does", { skip, ti
   t.after(() => relay.close());
   const linked = await connectClient(t, relay.port, "/link");
   linked.send(JSON.stringify({ kind: "hello", protocol: 1, version: "0.9.0", name: "Firefox", capabilities: [] }));
-  await untilKind(linked, "hello");
+  const { snapshot } = await untilKind(linked, "hello");
   await serveAsBrowserHost(t, relay.port, extension);
   // Linked browsers see the dictionary list once every dictionary in it is installed here.
+  // `snapshot` follows the changes, as the linked browser's mirror does.
   let state = null;
-  while (state === null) state = (await untilKind(linked, "storage")).changes.dictionaryState ?? null;
+  while (state === null) {
+    const { changes } = await untilKind(linked, "storage");
+    Object.assign(snapshot, changes);
+    state = changes.dictionaryState ?? null;
+  }
   assert.equal(state.dictionaries.length, FIXTURES.length);
 
   let counter = 0;
@@ -85,6 +91,39 @@ test("the relay's engine answers as the extension's own engine does", { skip, ti
   const bogus = await viaRelay({ type: "hd_bogus", requestId: "b" });
   assert.deepEqual(bogus, { type: "hd_bogus_result", requestId: "b", ok: false,
     error: 'unsupported shared request "hoshidicts-offscreen" "hd_bogus"', generation: 0 });
+
+  // A lookup naming a profile is resolved by the host's worker before the engine
+  // (resolveLookupProfile): on records without profiles Japanese is the request
+  // without it, and any other is refused.
+  const japanese = { type: "hd_lookup", text: "食べる", requestId: "p" };
+  assert.deepEqual(comparable(await viaRelay({ ...japanese, profileId: "ja" })), comparable(await viaExtension(japanese)));
+  for (const profileId of ["en", "", 7]) {
+    assert.deepEqual(await viaRelay({ ...japanese, profileId }), { type: "hd_lookup_result", requestId: "p", ok: false,
+      error: "This language was removed in another Hachidori page.", generation: 0, errorCode: "profile-missing" });
+  }
+
+  // The language opt-in is answered whatever the records (answerLanguageOptIn),
+  // from the records the hello carried.
+  const languages = await import(pathToFileURL(join(HACHIDORI, "extension/sharing-languages.js")));
+  const optIn = async (message) => {
+    counter += 1;
+    const request = { target: "hoshidicts-worker", type: "hd_language_profiles_opt_in", requestId: "o", ...message };
+    linked.send(JSON.stringify({ kind: "request", id: `r${counter}`, message: request }));
+    return (await untilKind(linked, "reply")).response;
+  };
+  for (const codes of [[], ["en", "fr"]]) {
+    const missing = languages.missingLanguages(languages.snapshotLanguages(snapshot), languages.optInLanguages({ languages: codes }));
+    assert.deepEqual(missing, []);
+    assert.deepEqual(await optIn({ languages: codes }), { type: "hd_language_profiles_opt_in_result", requestId: "o", ok: true, error: null,
+      // packCodes: Japanese, then every pack the extension ships, as the relay ships them.
+      optIn: "accepted", snapshot, missingLanguages: missing, hostLanguages: languages.packCodes() });
+    assert.ok(languages.packCodes().length > 20, JSON.stringify(languages.packCodes()));
+  }
+  for (const codes of [undefined, ["EN"]]) {
+    assert.equal(languages.optInLanguages({ languages: codes }), null);
+    assert.deepEqual(await optIn({ languages: codes }), { type: "hd_language_profiles_opt_in_result", requestId: "o", ok: false,
+      error: "The language opt-in named no language packs.", generation: 0 });
+  }
 
   // Media is asked for with the generation of the reply that named it.
   const media = async (via, path) => {
@@ -138,6 +177,9 @@ test("the relay's engine answers as the extension's own engine does", { skip, ti
       { type: "hd_api_anki_fields", text: "漢字", entryType: "term", markers: ["glossary", "Expression", "expression"], includeMedia: true },
       { type: "hd_api_anki_fields", text: "漢字", entryType: "term", markers: ["glossary"], includeMedia: false },
       { type: "hd_api_anki_fields", text: "ありがとう", entryType: "term", markers: ["expression", "audio"], maxEntries: 1.5 },
+      // A marker keeps the spelling the request gave it (#711), audio included.
+      { type: "hd_api_anki_fields", text: "ありがとう", entryType: "term", markers: ["Expression", "Audio", "miscInfo"], maxEntries: 1,
+        includeMedia: true },
     ] : []),
   ]) {
     const request = { requestId: "a", ...message };

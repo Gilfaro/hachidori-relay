@@ -37,11 +37,17 @@ pub(crate) struct Note {
     pub(crate) fields: Fields,
     pub(crate) options: Map<String, Value>,
     pub(crate) tags: Vec<String>,
+    /// `audio` and `picture`: files `addNote` stores itself and appends to fields.
+    pub(crate) attachments: Map<String, Value>,
 }
 
 impl Note {
     pub(crate) fn to_json(&self) -> Value {
-        json!({ "deckName": self.deck, "modelName": self.model, "fields": fields_json(&self.fields), "options": self.options, "tags": self.tags })
+        let mut note = json!({ "deckName": self.deck, "modelName": self.model, "fields": fields_json(&self.fields), "options": self.options, "tags": self.tags });
+        if let Some(note) = note.as_object_mut() {
+            note.extend(self.attachments.clone());
+        }
+        note
     }
 
     /// The note with its options' `allowDuplicate` set.
@@ -121,7 +127,8 @@ pub(crate) fn update_keeps_field(template: &Map<String, Value>, request: &Value)
     let markers = templates::marker_names(template_value(template));
     let scene = markers.iter().any(|name| SENTENCE_MARKERS.contains(&name.as_str()))
         || (!markers.is_empty() && markers.iter().all(|name| SCENE_MEDIA_MARKERS.contains(&name.as_str())));
-    if !scene || js::truthy(request.get("netflix").and_then(|netflix| netflix.get("cue"))) {
+    let cue = |site: &str| js::truthy(request.get(site).and_then(|video| video.get("cue")));
+    if !scene || cue("netflix") || cue("youtube") || cue("crunchyroll") {
         return false;
     }
     let (Some(sentence), Some(matched)) = (request.get("sentence").and_then(Value::as_str), request.get("matched").and_then(Value::as_str))
@@ -537,7 +544,10 @@ mod tests {
         let template = json!({ "value": "{sentence}" }).as_object().unwrap().clone();
         assert!(update_keeps_field(&template, &json!({ "sentence": "猫", "matched": "猫", "matchOffset": 0 })));
         assert!(!update_keeps_field(&template, &json!({ "sentence": "黒い猫", "matched": "猫", "matchOffset": 2 })));
-        assert!(!update_keeps_field(&template, &json!({ "sentence": "猫", "matched": "猫", "matchOffset": 0, "netflix": { "cue": 1 } })));
+        for site in ["netflix", "youtube", "crunchyroll"] {
+            let request = json!({ "sentence": "猫", "matched": "猫", "matchOffset": 0, site: { "cue": 1 } });
+            assert!(!update_keeps_field(&template, &request), "a {site} cue is a line");
+        }
         assert_eq!(browse_query("a<b>\"c\""), "\"a&lt;b&gt;\\\"c\\\"\"");
         assert_eq!(note_ids_query(&[3, 1, 3]).unwrap(), "nid:3,1");
     }

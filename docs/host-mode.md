@@ -46,36 +46,150 @@ dictionaries from Settings or setup.
 
 ## Compatible Hachidori
 
-Host mode is compatible with Hachidori
-[`d959a09`](https://github.com/bee-san/hachidori/commit/d959a09810cbbcbf8a6113a154a45dfb2f0a88ae)
-(Multi-language support, Nov 4 2026). It was ported against
-[`8603ae5`](https://github.com/bee-san/hachidori/commit/8603ae554a5597e95e929d11232bacaf5976062a);
-the oracle suites (`HACHIDORI_SOURCE`) pass against `d959a09`. Against
-`8603ae5` one request differs, and the relay answers as `d959a09` does: the
-Yomitan API's `ankiCardFormats` with `profileIndex: null`, which `8603ae5`
-rejects and `d959a09` reads as profile 0 (`profileIndex ?? 0`), so
-`host-oracle.test.mjs` fails there on it. Its engine is
-Hoshidicts `9c4ccdf`, the submodule `d959a09` pins. `8603ae5` pins
-`a95758b`; `9c4ccdf` adds the language packs but keeps the Japanese pipeline
-identical to `a95758b` (Hoshidicts' `ja-*-parity` tests).
+Host mode is compatible with Hachidori 0.5.1,
+[`d41c37a`](https://github.com/bee-san/hachidori/commit/d41c37abe4ea54ef6ec885e9517bbf5655f3d718)
+(Nov 10 2026), language profiles included: a 0.5.1 browser can link to the
+relay, share every language pack the extension ships, mine and look up per
+profile, and use the HTTP API per profile, as with a browser host. Its engine
+is Hoshidicts `088ac5d`, the submodule `d41c37a` pins. What the relay does
+differently is listed under
+[Differences from the extension](#differences-from-the-extension).
 
-`d959a09` adds language profiles to the sharing protocol (Hachidori's
-docs/sharing.md, "Languages"). The relay keeps the single-language form,
-which that protocol keeps unchanged for Japanese-only hosts:
+The oracle suites run the extension's own code from a checkout of `d41c37a`
+(`HACHIDORI_SOURCE`) against the relay and pass:
 
-- Its hello does not advertise `language-profiles-v1`. A linked Hachidori
-  from `d959a09` on therefore does not opt in, and does not forward
-  `hd_profile_add` or `hd_profile_remove`; it uses the relay as it uses a
-  Japanese-only browser host. Older linked browsers are unaffected.
-- A browser host with a second language gives the relay's pull session, which
-  does not opt in, its Japanese view, so the relay mirrors its Japanese
-  profile.
-- A `profileId` in a linked Anki or import request is ignored, so it means the
-  Japanese profile, as on a host without profiles. `dictionaryDirections` and
-  `dictionaryTargetLanguages` in a mining request are accepted but have no
-  effect: they matter only for a profile's notes.
-- The Yomitan API's `profileIndex` follows `d959a09`: absent, `null` and `0`
-  select the one profile, and `ankiCardFormats` refuses any other index.
+| Suite (`tests/conformance/`) | What the extension's code checks |
+| --- | --- |
+| `host-oracle` | engine requests, lookups, kanji, media, status |
+| `import-oracle` | archive and upload imports, per profile |
+| `mutations-oracle` | dictionary mutations, custom dictionaries, profile add and remove |
+| `settings-oracle` | the settings worker: options, counts, marks, schema 2 records |
+| `anki-oracle` | preflight, Add, browse, statuses, audio and rendered fields |
+| `profiles-oracle` | lookups, Anki and the Yomitan API in each profile |
+| `sharing-oracle` | the extension's sharing host against the relay's, language opt-in |
+| `anki-index`, `anki-index-languages` | the duplicate index's pulls, repairs and sources per profile |
+| `host`, `api`, `sharing-relay` | the protocol, the HTTP API and the pull from a browser host |
+
+Recorded from it: `src/host/settings/testdata/options.json` (options
+normalisation) and `src/host/anki/testdata/languages.json` (Anki fields in
+each language, `scripts/anki-language-cases.mjs`).
+
+Each of `d41c37a`'s `test/` files that tests host behaviour has a relay
+counterpart:
+
+| Upstream `test/` | Relay |
+| --- | --- |
+| `sharing-protocol`, `sharing-host`, `sharing-profiles`, `capabilities`, `message-types` | `host.test.mjs`, `sharing-oracle`, `src/host/local.rs`, `sharing_languages.rs` |
+| `profiles`, `language-packs`, `language-library`, `language-scripts`, `engine-profile-code` | `profiles-oracle`, `src/host/settings/profiles.rs`, `src/host/profile.rs`, `setup.rs` |
+| `dictionary-import*`, `dictionary-index-storage`, `linked-import`, `frequency-direction`, `custom-dictionary` | `import-oracle`, `mutations-oracle`, `src/host/upload.rs`, `src/host/engine/` |
+| `recommended-*`, `setup-installer`, `setup-state`, `dictionary-update-schedule`, `update-check-timeout` | `src/host/setup.rs`, `remote.rs`, `updates.rs`, `updates-live.test.mjs` |
+| `anki*` (but `anki-addon`, `anki-offscreen-audio`), `kanji-group-mining`, `word-status-overrides`, `sentence`, `furigana` | `anki-oracle`, `anki-index*`, `src/host/anki/` |
+| `audio-repository`, `audio-sources`, `audio-languages`, `audio-content` | `src/host/anki/audio.rs`, `anki-oracle` |
+| `api-host`, `yomitan-parity`, `search-*` lookups | `api.test.mjs`, `profiles-oracle`, `src/host/yomitan.rs` |
+| `lookup-stats`, `reader-options`, `advanced-settings`, `experimental-*`, `low-memory-option` | `settings-oracle`, `src/host/settings/` |
+
+The rest test the extension's pages, content scripts and Settings (the popup,
+themes, Netflix, YouTube, Crunchyroll, user scripts, keybinds, backups), which
+the relay does not have.
+
+Behaviour 0.5.0 adds beyond the protocol, which the relay follows:
+
+- accepts the options 0.5.0 writes: `glossaryLayoutMode`
+  `"compact-popup-anki"` and the experimental `multipleLanguages` switch (a
+  0.5.0 browser's settings write was refused before);
+- stores an imported frequency list that declares `occurrence-based` but holds
+  ranks as `rank-based` (Hachidori #684, `src/host/engine/frequency.rs`);
+- repairs any term the duplicate index can answer for when Anki's browser is
+  opened, not only one the request named notes for (#683);
+- segments without decompressing glossaries or reading pitches, as 0.5.0's
+  `hdw_segment` does (Hoshidicts #84);
+- mines in a single request where Anki's own duplicate check is enough (#683):
+  with duplicate scope `model`, no overwrite and a first field of exactly
+  `{expression}`, preflight sends only `canAddNotesWithErrorDetail` and renders
+  only the first field and authored cloze fields, and Add is one `addNote` that
+  carries the screenshot and pronunciation as native attachments (media inside
+  rich HTML is stored first, in one `multi`), with no readback or enrichment;
+- keeps an Anki configuration's discovery while the configuration is unchanged,
+  as the extension does, and drops it when it has errors, when preflight fails
+  or finds the note invalid, and when an add fails;
+- writes Anki fields and the Yomitan API's fields under Compact popup and Anki
+  (#673): a row's glosses joined by " | ", Yomitan's compact gloss styles, and
+  Smaller Anki cards unwrapping the lists those styles show inline; the switch
+  is part of the Anki configuration, so toggling it refuses a stale Add.
+
+Behaviour 0.5.1 adds, which the relay follows:
+
+- accepts the options 0.5.1 writes: `googleDocs` and `youtubeMining` as
+  ordinary options, `userScripts` (with a stored `customPopupJavascript`
+  migrated to one script), the video mining media options
+  (`videoAudioFormat`, `videoAudioBitrate`, `videoImageFormat`,
+  `videoImageQuality`), the experimental `crunchyrollMining` switch and any
+  activation key name, `MouseRight` included; the new global options are not
+  per profile;
+- treats a Crunchyroll mining request as Netflix and YouTube ones: its media
+  stay with the linked browser, and Add keeps the fields a cue would fill;
+- refuses an Anki write that AnkiConnect rejects because an open Browser or
+  Edit window shows the note as a definite failure, with media released and an
+  explanation (#698), instead of "could not be confirmed";
+- renders `{miscinfo}`, the request's `miscInfo` or else its document title,
+  and keeps Yomitan API field markers' case (#711);
+- appends Settings' pasted known words (`hd_known_words_add`);
+- leaves Bee's Ultimate Kanji Dictionary's character ranks out of word lookups'
+  frequencies; the clicked-kanji route keeps them (#724);
+- answers word status from each profile's first Template across All of Anki:
+  with highlighting on and a narrower duplicate scope, the profile's index
+  keeps a second, all-decks snapshot, and a confirmed write updates both at one
+  row revision. Without it, word status is unavailable (`statuses: null`).
+
+Video media themselves (sentence audio as MP3 or Opus, GIF, WebP or AVIF) are
+recorded by the reading browser, which a linked browser never does, so the
+relay has none of their checks.
+
+Against `8603ae5` one request differs, and the relay answers as `d959a09` and
+later do: the Yomitan API's `ankiCardFormats` with `profileIndex: null`, which
+`8603ae5` rejects and `d959a09` reads as profile 0 (`profileIndex ?? 0`).
+
+Language profiles are part of the sharing protocol (Hachidori's
+docs/sharing.md, "Languages", and docs/languages.md 17.3-17.6). The relay hosts
+them as the extension's `background-sharing.js` does:
+
+- Its hello advertises `language-profiles-v1` once the records have a second
+  language, and then gives every browser the records' Japanese view until it
+  opts in. `hd_language_profiles_opt_in` is accepted with the records as
+  stored, or refused with `missingLanguages` and the Japanese view when they
+  hold a language the browser has no pack for. The relay's own packs
+  (`hostLanguages`) are Japanese and every pack the extension ships.
+- A browser that has not opted in has the `profileId` of its requests removed,
+  so they act on Japanese, and its profile requests are refused
+  (`PROFILES_NOT_SHARED`). An opted-in browser's `hd_profile_add` is refused
+  for a language the relay has no pack for ("The linked Hachidori does not have
+  {name}. Update it and try again."). A reply that carries a language a
+  browser lacks is sent as its Japanese view, and its link is closed.
+- Change frames go out as stored to opted-in browsers and as the Japanese
+  view to the rest. Records that gain profiles, or return to Japanese alone,
+  close every link once its requests are answered, so each says hello again;
+  a link that lacks a language the records gain is refused and closed; a
+  refused link whose packs now cover the records is closed so it can opt in.
+  A closing link's requests are refused with `CHANGING_LANGUAGES`. The
+  extension holds change frames back while it decides; the relay decides under
+  the store's lock, so no frame is sent from an older decision.
+- Lookups, personal-dictionary saves, the dictionary list's per-profile view,
+  the settings worker's writes, counts and marks, and imports (`profileId` of an
+  upload) act on the profile a request names.
+- The relay's pull session from a browser host opts in with the relay's packs,
+  so the relay mirrors the records as stored (see below).
+
+- The Yomitan API answers from the profile its `profileIndex` selects, as
+  `background-sharing.js`'s `apiProfile` does: absent, `null` and `0` select
+  the Japanese profile, `1`, `2` and so on the other profiles in Settings
+  order. An index past the last answers from profile 0, except for
+  `ankiCardFormats`, which refuses it with Yomitan's message. Lookups and kanji
+  name the profile, the dictionary list and downloads are the profile's view
+  (without another language's personal package), Anki fields are written in
+  the profile's language with each dictionary's target language, the
+  pronunciation fills `{language}` from its pack, and `/tokenize` gives no
+  readings in a language without ruby. The HTTP API forwards a numeric
+  `profileIndex` on every request that has a body.
 
 ## The data directory
 
@@ -124,9 +238,16 @@ generation; it is no longer used, and never served.
 ## Pulling from a browser host
 
 While a browser host is connected, the relay keeps one in-process client
-session open to it. That session has the same origin (`relay://yomitan-api`) and
-capability (`hoshidicts-api-v1`) as the API session, so the browser does not
-list it as a linked browser.
+session open to it, with the API session's capability (`hoshidicts-api-v1`) and
+its own origin, `relay://hachidori-relay`. The extension exempts the API's
+origin (`relay://yomitan-api`) from the reconnections that language changes
+force, because the API keeps no mirror; the pull session keeps one, so it must
+reconnect and opt in again like any linked browser, and the browser lists it
+among its linked browsers. When the browser's hello offers
+`language-profiles-v1`, the session opts in with the relay's packs and mirrors
+the opt-in's snapshot in place of the hello's (change frames that arrive before
+the reply are dropped, as that snapshot is newer). A refused opt-in mirrors the
+Japanese view and is logged.
 
 1. The browser's `hello` snapshot overwrites the six stored keys. A key missing
    from the snapshot is removed. The browser's values always win.
@@ -158,7 +279,7 @@ The relay answers as the extension's `sharing-host.js` does:
 
 - `hello` (protocol 1) gets `{kind: "hello", protocol: 1, version:
   "hachidori-relay/<version>", name: "Hachidori Relay", dictionaryCount,
-  capabilities: ["hoshidicts-api-v1", "linked-import-v1", "linked-anki-v2"], snapshot}`. The snapshot is the six keys,
+  capabilities: ["hoshidicts-api-v1", "linked-import-v1", "linked-anki-v2"], snapshot}`, plus `language-profiles-v1` while the records have profiles (and the snapshot is then their Japanese view). The snapshot is the six keys,
   `null` for any that were never set.
 - Another protocol, or a frame that cannot be read, gets `bye` with the
   extension's reason, and the connection is closed.
@@ -235,8 +356,28 @@ The relay answers as the extension's `sharing-host.js` does:
     `hd_anki_word_status` read the duplicate index, which the relay keeps in
     `ankiDuplicateIndex` as the extension does (`anki-index-cache.js`): pulled at
     start, when `options` change, and every 30 minutes, from the selected note
-    type's notes. Each change of its rows or source reaches linked browsers as a
+    type's notes. With language profiles, each profile's first Template is a
+    source of its own (its language's note-type families: none outside
+    Japanese), with its own snapshot and 30-minute schedule, pulled one at a
+    time in profile order under one row revision; with one source the record
+    keeps the single-snapshot shape. A request that names a profile
+    (`profileId`) reads that profile's Templates, whose ids become profile keys
+    (`profileTemplateKey`), and its status says `emptyDeck` when only the deck
+    is missing. Each change of its rows or source reaches linked browsers as a
     storage frame and a `word-status` frame.
+  - A note mined in a profile follows its language (upstream docs/languages.md
+    12): glossary text takes its language by script and each dictionary's
+    target language (`dictionaryTargetLanguages`), a right-to-left profile or
+    dictionary roots the glossary in its direction and marks each block of the
+    other one, the sentence and right-to-left dictionary names keep their own
+    direction, `{part-of-speech}` reads the pack's labels, and without ruby the
+    furigana markers give the plain headword and the sentence is not split.
+    The sentence's split (`hd_segment`) and every other engine request the
+    relay makes for Anki or the API carry the profile's fields, as the
+    extension's relay to its offscreen document adds them. A target language
+    without a pack takes the platform's likely script for its language
+    (`scripts/language-names.mjs`); unlike `Intl.Locale`, a region does not
+    change it.
   - `hd_anki_browse` repairs a stale duplicate (looks the word up again) and
     opens Anki's browser on its notes (`guiBrowse`).
   - `hd_anki_discover` and `hd_anki_setup` read decks, note types and fields,
@@ -262,7 +403,9 @@ The relay answers as the extension's `sharing-host.js` does:
     deletes the screenshot it stored; a write whose answer was lost is reported
     as uncertain, never retried.
   - Pronunciations come from the enabled audio sources (an audio URL, or a
-    Yomitan JSON list), downloaded by the relay itself.
+    Yomitan JSON list), downloaded by the relay itself. A URL Template's
+    `{language}` is the `host.audioLanguage` of the note's profile's pack
+    (upstream docs/languages.md 13), Japanese's `ja` without profiles.
 - Managed dictionary updates (`hachidori-updates`) are the extension's
   `background-updates.js`. `hd_updates_schedule` writes the schedule
   (`dictionaryUpdates`) against its revision. `hd_updates_check` reads the
@@ -298,17 +441,51 @@ The rules are ported from the extension's JavaScript to Rust (`src/host/settings
 with its own smoke-test fakes and the same stored settings as a relay, sends each
 request of a scripted sequence (commits, conflicts, refusals and errors, from a
 current and a legacy client) to both, and requires the same reply and the same
-shared storage after every step. `tests/conformance/anki-oracle.test.mjs` does the
+shared storage after every step. It repeats a shorter sequence over records an
+earlier release stored or that were damaged (upstream's migration cases: the
+removed hover delay, the renamed blur-count switch, legacy Anki settings and
+links, the old recorder settings, endpoint URLs, malformed word marks), so
+both sides migrate them alike. `tests/conformance/anki-oracle.test.mjs` does the
 same for Anki: both sides use one fake AnkiConnect (`anki-fake.mjs`, a small
 collection with Anki's search syntax and its add check), and each reply, the
 stored duplicate index, the queries sent to Anki's browser and the notes sent to
 Anki's add check (the rendered fields) must agree. Each submission runs on both
 sides from the same collection, and the notes and media files each leaves in it
-must agree too; the fake also serves the pronunciations. The extension's side
+must agree too; the fake also serves the pronunciations. The relay holds the
+extension's fixture dictionary, whose image and styles the extension's side reads
+from the relay's engine, and the fake can fail part-way (`state.faults`: a refused
+action, a connection lost before or after the action ran, a media store not kept,
+the collection edited around an action), so unconfirmed writes, failed readbacks,
+add-on rewrites and lost media are compared too, and a second Template, on
+another note type, deck and duplicate scope, is chosen by `templateId` in
+status, view, setup, preflight, submit and browse requests. Senren and Lapis
+notes are mined with the Templates upstream's `applyAnkiPreset` fills, after a
+setup proposal for Senren, with the page's selection, title, address and search
+and the sentence with furigana (the extension's side splits it with the relay's
+engine), and a kanji entry is mined into a note with its character, readings and
+stroke count.
+`tests/conformance/anki-index.test.mjs` follows the duplicate index through a
+relay's restarts, with the stored attempt set around the clock: a recent pull,
+even a failed one, is not repeated; an interrupted one is retried at once; a
+failed or malformed pull keeps the previous snapshot; a duplicate-scope change
+replaces the index at once and a duplicate-policy change keeps it; and after an
+endpoint change the old collection's rows are never answered.
+`tests/conformance/anki-index-languages.test.mjs` follows upstream's
+`anki-index-languages.test.mjs` with two profiles: one snapshot and attempt per
+source in profile order, answered for the profile a request names; a repair
+in one profile moving the shared row revision; each source's own backoff after
+a failed pull; and a profile's new source dropping only its old snapshot, back
+to the single record when one source is left. Chromium's quoting of a scoped
+style's `[data-dictionary=...]` selector, which jsdom does not apply, is the one
+normalisation. The extension's side
 renders in jsdom with its own `buildAnkiResourceFields` and downloads with its
 own `exportAnkiAudio`, with a stand-in for the browser's audio decoding. The option normalisation and the custom
 dictionary's parser and semantic revision are also checked against 4,321 cases
-recorded from the extension's code (`scripts/settings-cases.mjs`).
+recorded from the extension's code (`scripts/settings-cases.mjs`), and notes in
+each language profile against 30 cases its note builder made from upstream's
+language scenarios (`scripts/anki-language-cases.mjs`: Japanese, English,
+Arabic, Korean and Chinese results, with and without profiles, full and Smaller
+Anki cards).
 
 ## The engine
 
@@ -318,15 +495,29 @@ the enabled dictionaries of the stored `dictionaryState` in order, every kind
 each package has (terms, frequencies, pitches, kanji), and reloads when that list
 changes. A package that fails to load is skipped, and its error is listed in
 `hd_status`. The engine runs on blocking threads, one request at a time.
+`hd_segment` looks up every position of a chunk and keeps every result, but
+reads only their words, frequencies and dictionaries, so its lookups decompress
+no glossary and collect no pitches, as the extension's do from 0.5.0.
 
 `tests/conformance/host-oracle.test.mjs` checks this against the real extension.
 It boots the extension's engine service on its own wasm build, imports its test
 dictionaries, mirrors them into the relay, and requires the same reply from both
 for every request it sends. `tests/conformance/mutations-oracle.test.mjs` does
-the same for the mutations: it builds, appends to, re-saves and empties the custom
-dictionary, reorders, disables and removes dictionaries, and sends refused and
+the same for the mutations: it builds, appends to, re-saves (CRLF, and 2,500 lines across
+the builder's 1000-row banks) and empties the custom dictionary, reorders, disables and removes dictionaries, and sends refused and
 invalid requests, and requires the same replies, the same stored dictionary state
 and custom source after every step, and the same lookups over the result.
+`tests/conformance/profiles-oracle.test.mjs` does the same for language profiles,
+sending each request as a page of the extension does (its background names the
+profile's fields): it adds and removes languages (with an erase, and a stale one),
+saves and appends to English's personal dictionary beside Japanese's, edits each
+profile's view of the dictionary list, refuses an older client's removal of a
+package another language uses, and looks words up by profile.
+`tests/conformance/sharing-oracle.test.mjs` links the same browsers to the
+extension's own sharing host, through an in-memory relay, and to the relay:
+older browsers, profile-aware ones with and without a language, and the
+records gaining and losing languages. Every hello, opt-in, reply, change frame
+and forced reconnection must agree.
 `tests/conformance/import-oracle.test.mjs` uploads the same archives, with the
 extension's own `uploadDictionary`, to the extension's upload host and to the
 relay: new, kept beside, replacing a dictionary and a mirrored fixture, archives
@@ -346,8 +537,22 @@ already installed on a second run.
 
 ## Differences from the extension
 
-- The relay has one profile, Japanese: no language profiles, and no
-  `language-profiles-v1` (see [Compatible Hachidori](#compatible-hachidori)).
+- Backups, restoring one, automatic snapshots and resetting lookup counts are
+  not ported: they are the extension's own Settings features, which the
+  sharing protocol does not forward. A dictionary download is the only archive
+  the relay builds.
+- `hd_language_selection_write`, which records the language a browser's
+  Settings shows, has no relay counterpart: the relay has no Settings page.
+- The extension holds change frames back while it decides which view each
+  link gets; the relay decides under its store's lock, so no frame goes out
+  from an older decision and none needs holding.
+- The relay's pull from a browser host is one more linked browser there (it
+  opts in to profiles with the relay's packs), and the browser host's Sharing
+  page lists it.
+- Adding or removing a language profile runs in the relay's process, so no
+  reply can be lost between deciding and storing it; the extension reads its
+  records back after a lost reply (`profileCasReadback`), and the relay has
+  nothing to read back.
 - Storage is written behind, at most once per write delay (see
   [The data directory](#the-data-directory)); the extension's storage writes
   each change. A crash loses at most the last delay's changes, never a
@@ -358,16 +563,16 @@ already installed on a second run.
   same in each, so cards look the same; each dictionary stylesheet is then scoped
   and parsed once per note instead of once per field.
 - The hello's `name` is `Hachidori Relay` and its `version` is
-  `hachidori-relay/<version>`. It advertises `hoshidicts-api-v1`,
-  `linked-import-v1` and `linked-anki-v2`, but not the legacy
-  `linked-anki-v1`: a linked browser too old for host-owned mining is told to
-  update.
-- The recommended-dictionary installer reports no download progress and no
-  installing phase: an entry goes from `downloading` to its outcome, with
-  `receivedBytes` 0 and `seconds` 0 for an install. Linked pages learn of
-  progress by asking, every four seconds, as they already do; there are no
-  `hd_setup_progress` events. Startup's onboarding record (`setupState`) is
-  never written, as the extension does not write it for a shared request.
+  `hachidori-relay/<version>`. Its capabilities are the extension's host list:
+  `linked-anki-v1`, `linked-anki-v2`, `hoshidicts-api-v1` and
+  `linked-import-v1`, and `language-profiles-v1` while the records have profiles. A reader that predates Templates mines with the first
+  one and edits its legacy fields, as with the extension.
+- The recommended-dictionary installer's entries report their download bytes,
+  the installing phase and the installation's duration, as the extension's do.
+  Linked pages learn of them by asking, every four seconds, as they already
+  do; there are no `hd_setup_progress` events. Startup's onboarding record
+  (`setupState`) is never written, as the extension does not write it for a
+  shared request.
 - The update schedule is looked at once a minute rather than by a browser
   alarm, and not while a browser host is connected at `/host`: that browser
   runs its own schedule, and the relay mirrors its dictionaries.
@@ -389,6 +594,14 @@ already installed on a second run.
 - `hd_apply_state`'s `loadPath` is always `"full"`. The relay always loads
   the whole list again; the extension also reorders in place (`"order-only"`) or
   adds and drops single packages (`"incremental"`).
+- The duplicate index reads only the note fields it keys (`notesInfo`'s
+  `noteFields`, which the AnkiConnect fork at
+  [JSchoreels/anki-connect](https://github.com/JSchoreels/anki-connect)
+  `3f3cb0a` accepts); the extension reads whole notes. 0.5.0's Anki caching
+  keeps configurations and mines in one request but still reads whole notes on
+  every pull and live lookup, so the projection still pays on a large
+  collection. An AnkiConnect that rejects the parameter is asked once; the
+  relay then reads whole notes until it restarts.
 - `hd_reload` loads the stored `dictionaryState` again. The extension's
   `reconcile` also adopts packages it finds on disk that no list names and
   migrates a legacy dictionary list; the relay has neither.

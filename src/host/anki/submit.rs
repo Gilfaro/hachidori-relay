@@ -11,8 +11,9 @@ use serde_json::{Map, Value, json};
 
 use super::duplicates::{self, Fields, Note, Templates, fields_json};
 use super::gateway::{Failure, Result};
-use super::media::{self, ClientMedia, DictionaryMedia};
-use super::preflight::{self, Applied, Prepared, Resources};
+use super::glossary::Layout;
+use super::media::{self, AddFile, ClientMedia, DictionaryMedia};
+use super::preflight::{self, Applied, Decision, Prepared, Resources};
 use super::{Anki, CONFIG_CHANGED, Invoke, index, positive_id, templates};
 use crate::host::js;
 
@@ -123,51 +124,77 @@ fn release_captured(invoke: &Invoke<'_>, captured: Option<&str>) {
     }
 }
 
-/// What `prepareWrite` did: its warnings and the screenshot it stored.
+/// What `prepareWrite` or `prepareAdd` did: its warnings, the screenshot it
+/// stored or attached, and the note's native attachments.
 #[derive(Default)]
 struct WriteResources {
     warnings: Vec<String>,
     screenshot: Option<String>,
+    attachments: Map<String, Value>,
+}
+
+/// `takePendingMedia("screenshot")`'s answer.
+enum Taken {
+    /// The fields reference no screenshot.
+    None,
+    /// The screenshot cannot go with the note; its references are gone.
+    Without(String),
+    /// The linked browser's screenshot for this note: its filename and data.
+    Pending(String, String),
+}
+
+/// The note goes without the screenshot, and so does a later render.
+fn without_screenshot(request: &mut Value, fields: &mut Fields, filename: &str, reason: &str) -> String {
+    let reference = format!("<img src=\"{filename}\">");
+    let mut unavailable = request.get("captureUnavailable").and_then(Value::as_array).cloned().unwrap_or_default();
+    unavailable.push(json!("screenshot"));
+    request["captureUnavailable"] = Value::Array(unavailable);
+    for (_, value) in fields.iter_mut() {
+        *value = value.replace(&reference, "");
+    }
+    format!("Screenshot: {reason}")
+}
+
+/// `takePendingMedia("screenshot")`: the linked browser's screenshot, if the
+/// fields still reference it and it is the one this note captured.
+fn take_screenshot(request: &mut Value, fields: &mut Fields, media: &ClientMedia) -> Taken {
+    let Some(filename) = request.get("screenshot").and_then(|screenshot| screenshot.get("filename")).and_then(Value::as_str) else {
+        return Taken::None;
+    };
+    let filename = filename.to_owned();
+    let reference = format!("<img src=\"{filename}\">");
+    if filename.is_empty() || !fields.iter().any(|(_, value)| value.contains(&reference)) {
+        return Taken::None;
+    }
+    let token = request["screenshot"].get("token").cloned();
+    match media.screenshot.as_ref().filter(|pending| Some(json!(pending.token)) == token && pending.filename == filename) {
+        Some(pending) => Taken::Pending(filename, pending.data.clone()),
+        None => Taken::Without(without_screenshot(request, fields, &filename, SCREENSHOT_REPLACED)),
+    }
 }
 
 /// `storePendingMedia("screenshot")`: the linked browser's screenshot, stored if
 /// the fields still reference it; otherwise the references go.
 fn store_screenshot(invoke: &Invoke<'_>, request: &mut Value, fields: &mut Fields, media: &ClientMedia) -> WriteResources {
-    let Some(filename) = request.get("screenshot").and_then(|screenshot| screenshot.get("filename")).and_then(Value::as_str) else {
-        return WriteResources::default();
+    let (filename, data) = match take_screenshot(request, fields, media) {
+        Taken::None => return WriteResources::default(),
+        Taken::Without(warning) => return WriteResources { warnings: vec![warning], ..WriteResources::default() },
+        Taken::Pending(filename, data) => (filename, data),
     };
-    let filename = filename.to_owned();
-    let reference = format!("<img src=\"{filename}\">");
-    if filename.is_empty() || !fields.iter().any(|(_, value)| value.contains(&reference)) {
-        return WriteResources::default();
-    }
-    let token = request["screenshot"].get("token").cloned();
-    let mut without = |reason: &str| {
-        let mut unavailable = request.get("captureUnavailable").and_then(Value::as_array).cloned().unwrap_or_default();
-        unavailable.push(json!("screenshot"));
-        request["captureUnavailable"] = Value::Array(unavailable);
-        for (_, value) in fields.iter_mut() {
-            *value = value.replace(&reference, "");
-        }
-        WriteResources { warnings: vec![format!("Screenshot: {reason}")], screenshot: None }
-    };
-    let pending = media.screenshot.as_ref().filter(|pending| Some(json!(pending.token)) == token && pending.filename == filename);
-    let Some(pending) = pending else { return without(SCREENSHOT_REPLACED) };
-    let stored =
-        invoke("storeMediaFile", json!({ "filename": filename, "data": pending.data, "deleteExisting": false }), Some(STORE_TIMEOUT_MS))
-            .and_then(|stored| {
-                if stored.as_str() == Some(filename.as_str()) {
-                    Ok(())
-                } else {
-                    Err(Failure::new("Anki stored it under a different filename."))
-                }
-            });
+    let stored = invoke("storeMediaFile", json!({ "filename": filename, "data": data, "deleteExisting": false }), Some(STORE_TIMEOUT_MS))
+        .and_then(|stored| {
+            if stored.as_str() == Some(filename.as_str()) {
+                Ok(())
+            } else {
+                Err(Failure::new("Anki stored it under a different filename."))
+            }
+        });
     match stored {
-        Ok(()) => WriteResources { warnings: Vec::new(), screenshot: Some(filename) },
+        Ok(()) => WriteResources { screenshot: Some(filename), ..WriteResources::default() },
         Err(error) => {
             // The store may have happened although its answer did not arrive.
             release_captured(invoke, Some(&filename));
-            without(&error.message)
+            WriteResources { warnings: vec![without_screenshot(request, fields, &filename, &error.message)], ..WriteResources::default() }
         }
     }
 }
@@ -246,9 +273,107 @@ impl Anki {
         Ok(captured)
     }
 
-    /// The Template's configuration as it is now, as JSON (\`null\` once it is gone).
-    fn config_json(&self, template_id: Option<&Value>) -> String {
-        Self::read_config(&self.options(), template_id).map_or_else(|| "null".to_owned(), |config| Value::Object(config).to_string())
+    /// `prepareAdd`: a native add's media. A pronunciation outside the first field
+    /// is resolved once and rendered into the note; it, the screenshot and the
+    /// dictionary images the note references go with the add.
+    fn prepare_add(
+        &self,
+        invoke: &Invoke<'_>,
+        prepared: &Prepared,
+        request: &mut Value,
+        fields: &mut Fields,
+        resources: &mut Resources,
+        media: &ClientMedia,
+    ) -> Result<WriteResources> {
+        let mut written = WriteResources::default();
+        let mut files: Vec<AddFile> = Vec::new();
+        let config = &prepared.current.config;
+        let audio_templates: Templates = prepared
+            .templates()
+            .iter()
+            .filter(|(_, template)| {
+                templates::marker_names(template.get("value").and_then(Value::as_str).unwrap_or_default())
+                    .iter()
+                    .any(|name| name == "audio")
+            })
+            .cloned()
+            .collect();
+        let sources = config.get("audioSources").and_then(Value::as_array).is_some_and(|sources| !sources.is_empty());
+        if !audio_templates.is_empty() && sources {
+            let rendered = Self::audio(request, config).and_then(|file| {
+                let (built, planned) = self.render(
+                    request,
+                    &audio_templates,
+                    &format!("[sound:{}]", file.filename),
+                    Layout::of(config),
+                    config.get("profile"),
+                )?;
+                Ok((file, built, planned))
+            });
+            match rendered {
+                Ok((file, built, planned)) => {
+                    for (field, value) in built {
+                        match fields.iter_mut().find(|(name, _)| *name == field) {
+                            Some((_, existing)) => *existing = value,
+                            None => fields.push((field, value)),
+                        }
+                    }
+                    resources.media.extend(planned);
+                    files.push(AddFile {
+                        filename: file.filename,
+                        data: file.data,
+                        picture: false,
+                        kind: "pronunciation".to_owned(),
+                        required: false,
+                    });
+                }
+                Err(error) => written.warnings.push(format!("Pronunciation: {}", error.message)),
+            }
+        }
+        match take_screenshot(request, fields, media) {
+            Taken::None => {}
+            Taken::Without(warning) => written.warnings.push(warning),
+            Taken::Pending(filename, data) => {
+                written.screenshot = Some(filename.clone());
+                files.push(AddFile { filename, data, picture: true, kind: "Screenshot".to_owned(), required: false });
+            }
+        }
+        let generation = request.get("generation").cloned();
+        let mut attach = || -> Result<Vec<String>> {
+            // One file per filename, the last planned, in the order first planned.
+            let mut planned: Vec<&DictionaryMedia> = Vec::new();
+            for item in &resources.media {
+                match planned.iter_mut().find(|known| known.filename == item.filename) {
+                    Some(known) => *known = item,
+                    None => planned.push(item),
+                }
+            }
+            for item in planned.into_iter().filter(|item| fields.iter().any(|(_, value)| value.contains(&item.filename))) {
+                let data = self.dictionary_media(item, generation.as_ref())?;
+                files.push(AddFile {
+                    filename: item.filename.clone(),
+                    data,
+                    picture: true,
+                    kind: "dictionary image".to_owned(),
+                    required: true,
+                });
+            }
+            self.current_generation(request)?;
+            media::attach_add_media(fields, &mut written.attachments, &files, invoke)
+        };
+        match attach() {
+            Ok(warnings) => written.warnings.extend(warnings),
+            Err(error) => {
+                release_captured(invoke, written.screenshot.as_deref());
+                return Err(error);
+            }
+        }
+        Ok(written)
+    }
+
+    /// The Template's configuration as it is now, as JSON (`null` once it is gone).
+    fn config_json(&self, template_id: Option<&Value>) -> std::result::Result<String, String> {
+        Ok(self.read_config(template_id)?.map_or_else(|| "null".to_owned(), |config| Value::Object(config).to_string()))
     }
 
     /// `enrichAnkiNote`: a pronunciation for the fields that want one but were
@@ -296,8 +421,8 @@ impl Anki {
             if !confirmed.contains(&file.filename) {
                 media::ensure(invoke, &file.filename, "pronunciation", &mut || Ok(file.data.clone()), &|| Ok(()))?;
             }
-            let compact = config.get("compactGlossary") == Some(&Value::Bool(true));
-            let (rendered, _) = self.render(request, &templates, &format!("[sound:{}]", file.filename), compact)?;
+            let (rendered, _) =
+                self.render(request, &templates, &format!("[sound:{}]", file.filename), Layout::of(config), config.get("profile"))?;
             let incoming = match existing {
                 Some(existing) => duplicates::overwrite_fields(&rendered, existing, &templates, true),
                 None => rendered,
@@ -324,13 +449,46 @@ impl Anki {
         Ok(warnings)
     }
 
+    /// The reply to an add Anki refused as a duplicate: the notes it means.
+    fn duplicate_reply(
+        &self,
+        invoke: &Invoke<'_>,
+        prepared: &Prepared,
+        note: &Note,
+        fields: &Fields,
+        expression: Option<&Value>,
+    ) -> Map<String, Value> {
+        let config = &prepared.current.config;
+        let note_ids: Vec<i64> = if index::source(config).is_none() {
+            duplicates::find_duplicates(invoke, note, &prepared.first_field, config)
+                .map(|found| found.iter().map(|found| found.note_id).collect())
+                .unwrap_or_default()
+        } else {
+            self.index.find(self, config, expression, invoke, true).map(|found| found.note_ids).unwrap_or_default()
+        };
+        let first = &prepared.first_field;
+        let value = duplicates::field(fields, first).or_else(|| duplicates::field(&note.fields, first)).unwrap_or_default();
+        let value = js::trim(value);
+        let shown = if value.is_empty() { "empty".to_owned() } else { format!("“{value}”") };
+        let error =
+            format!("Anki already has a note in deck “{}” (note type “{}”) whose first field “{first}” is {shown}.", note.deck, note.model);
+        super::object(json!({ "state": "duplicate", "noteIds": note_ids, "error": error }))
+    }
+
     /// `write`: the note, decided again against a fresh configuration, written once.
     fn write(&self, request: &mut Value, media: &ClientMedia) -> Reply {
         let template_id = request.get("templateId").cloned();
         let mut prepared = self.prepare(request, true)?;
         let config = prepared.current.config.clone();
         let invoke = self.config_invoker(&config);
-        let checked = self.decision(&invoke, &prepared, request).map_err(|error| error.message)?;
+        // A native add is itself the authoritative duplicate, empty and cloze
+        // check: a second check adds latency without closing a race with Anki.
+        let direct = preflight::native_check(&prepared.current);
+        let checked = if direct {
+            Decision { state: "addable", can_add: true, ..Decision::default() }
+        } else {
+            self.decision(&invoke, &prepared, request).map_err(|error| error.message)?
+        };
         if !checked.can_add {
             let mut reply = Map::new();
             reply.insert("state".to_owned(), json!(checked.state));
@@ -345,21 +503,26 @@ impl Anki {
         }
         let Applied { mut fields, target, .. } =
             preflight::fields_for_decision(&prepared, &checked, request).map_err(|error| error.message)?;
-        if self.config_json(template_id.as_ref()) != prepared.config_json {
+        if self.config_json(template_id.as_ref())? != prepared.config_json {
             return Err(CONFIG_CHANGED.to_owned());
         }
         let mut resources = std::mem::take(&mut prepared.resources);
-        let written = self.prepare_write(&invoke, request, &mut fields, &mut resources, media);
+        let written = if direct {
+            self.prepare_add(&invoke, &prepared, request, &mut fields, &mut resources, media)
+        } else {
+            self.prepare_write(&invoke, request, &mut fields, &mut resources, media)
+        };
         prepared.resources = resources;
         let write_resources = written.map_err(|error| error.message)?;
         // Failed media can restore a field's original value: leave it untouched.
         preflight::omit_unchanged(&mut fields, target.as_ref().map(|(_, fields)| fields));
         let release = || release_captured(&invoke, write_resources.screenshot.as_deref());
-        if self.config_json(template_id.as_ref()) != prepared.config_json {
+        if self.config_json(template_id.as_ref())? != prepared.config_json {
             release();
             return Err(CONFIG_CHANGED.to_owned());
         }
         if let Err(error) = self.current_generation(request) {
+            self.retire(template_id.as_ref());
             release();
             return Err(error.message);
         }
@@ -367,30 +530,22 @@ impl Anki {
         if target.is_none() {
             // A new note's fields are the ones media preparation may have changed.
             note.fields.clone_from(&fields);
+            note.attachments.clone_from(&write_resources.attachments);
         }
         let expression = request["term"].get("expression").or_else(|| request.get("expression")).filter(|value| !value.is_null()).cloned();
-        let note_id = match write_note(&invoke, &note, target.as_ref().map(|(id, _)| *id), &fields) {
+        let written = write_note(&invoke, &note, target.as_ref().map(|(id, _)| *id), &fields);
+        if written.is_err() {
+            self.retire(template_id.as_ref());
+        }
+        let note_id = match written {
             Ok(note_id) => note_id,
             Err(error) if duplicates::is_duplicate_error(&error.message) => {
                 release();
-                let note_ids = if index::source(&config).is_none() {
-                    duplicates::find_duplicates(&invoke, &note, &prepared.first_field, &config)
-                        .map(|found| found.iter().map(|found| found.note_id).collect())
-                        .unwrap_or_default()
-                } else {
-                    self.index.find(self, &config, expression.as_ref(), &invoke, true).map(|found| found.note_ids).unwrap_or_default()
-                };
-                let first = &prepared.first_field;
-                let value = duplicates::field(&fields, first).or_else(|| duplicates::field(&note.fields, first)).unwrap_or_default();
-                let value = js::trim(value);
-                let shown = if value.is_empty() { "empty".to_owned() } else { format!("“{value}”") };
-                let error = format!(
-                    "Anki already has a note in deck “{}” (note type “{}”) whose first field “{first}” is {shown}.",
-                    note.deck, note.model
-                );
-                return Ok(super::object(json!({ "state": "duplicate", "noteIds": note_ids, "error": error })));
+                return Ok(self.duplicate_reply(&invoke, &prepared, &note, &fields, expression.as_ref()));
             }
-            Err(error) if error.undispatched() => {
+            // Nothing reached Anki, or AnkiConnect refused before writing because an
+            // open editor shows the note: a definite failure the reader may retry.
+            Err(error) if error.undispatched() || error.editor_conflict() => {
                 release();
                 return Err(error.message);
             }
@@ -402,6 +557,11 @@ impl Anki {
         };
         let mut warnings = write_resources.warnings.clone();
         self.index.record_write(self, &config, expression.as_ref(), note_id, checked.mature);
+        // A native add has already accepted the whole note, its media included:
+        // there is no deferred update that needs a readback.
+        if direct {
+            return Ok(super::object(json!({ "state": "added", "noteId": note_id, "warnings": warnings })));
+        }
         // A field an add-on rewrote is reported; only a first field Anki did not
         // save as submitted leaves the note unverified, and unenriched.
         let verified = match read_note_fields(&invoke, note_id) {
@@ -423,8 +583,6 @@ impl Anki {
                 Err(error) => warnings.push(error.message),
             }
         }
-        let cache_key = template_id.as_ref().and_then(Value::as_str).unwrap_or_default().to_owned();
-        self.configured.lock().unwrap_or_else(PoisonError::into_inner).remove(&cache_key);
         Ok(super::object(json!({ "state": if target.is_some() { "updated" } else { "added" }, "noteId": note_id, "warnings": warnings })))
     }
 
@@ -449,6 +607,7 @@ mod tests {
             fields: vec![("Expression".to_owned(), "<br>".to_owned())],
             options: Map::new(),
             tags: Vec::new(),
+            attachments: Map::new(),
         };
         let error = add_note_context(Failure::new("Anki refused (AnkiConnect: cannot create note because it is empty)"), &note);
         assert_eq!(

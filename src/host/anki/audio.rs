@@ -74,8 +74,27 @@ fn encode_value(value: &str) -> String {
     utf8_percent_encode(value, COMPONENT).to_string()
 }
 
-/// `audioSourceUrl`: the source's URL Template with the term's placeholders filled.
-fn audio_source_url(template: &str, term: &Value) -> Result<String> {
+/// `pronunciationLanguage`: the speech name and URL language of a profile's
+/// pack (upstream docs/languages.md 13). A language without a pack, or a
+/// request that names none, keeps Japanese.
+#[derive(Clone, Copy)]
+pub(crate) struct Pronunciation {
+    name: &'static str,
+    url: &'static str,
+}
+
+impl Pronunciation {
+    pub(crate) const JAPANESE: Self = Self { name: "Japanese", url: "ja" };
+
+    pub(crate) fn of(code: Option<&str>) -> Self {
+        let Some(pack) = code.and_then(crate::host::registry::get) else { return Self::JAPANESE };
+        Self { name: pack["name"].as_str().unwrap_or_default(), url: pack["host"]["audioLanguage"].as_str().unwrap_or_default() }
+    }
+}
+
+/// `audioSourceUrl`: the source's URL Template with the term's placeholders
+/// filled, `{language}` with the pack's `host.audioLanguage`.
+fn audio_source_url(template: &str, term: &Value, language: Pronunciation) -> Result<String> {
     http_url(template)?;
     let expression = encode_value(&js::to_string(term.get("expression")));
     let reading = encode_value(&js::to_string(term.get("reading")));
@@ -92,7 +111,7 @@ fn audio_source_url(template: &str, term: &Value) -> Result<String> {
                 match key {
                     "term" | "expression" => out.push_str(&expression),
                     "reading" => out.push_str(&reading),
-                    "language" => out.push_str("ja"),
+                    "language" => out.push_str(&encode_value(language.url)),
                     _ => {
                         out.push('{');
                         out.push_str(key);
@@ -155,8 +174,9 @@ fn remaining(deadline: Instant) -> Result<Duration> {
 /// `response`: `fetch(url, { credentials: "omit" })`, its body read whole.
 fn download(url: &str, deadline: Instant, what: &str) -> Result<Downloaded> {
     let left = remaining(deadline)?;
-    let agent: ureq::Agent =
-        ureq::Agent::config_builder().max_redirects(20).http_status_as_error(false).timeout_global(Some(left)).build().into();
+    let agent = crate::host::loopback::agent(
+        ureq::Agent::config_builder().max_redirects(20).http_status_as_error(false).timeout_global(Some(left)).build(),
+    );
     let failed = |error: &ureq::Error| {
         if matches!(error, ureq::Error::Timeout(_)) {
             Failure::new(TIMED_OUT)
@@ -183,18 +203,18 @@ fn download(url: &str, deadline: Instant, what: &str) -> Result<Downloaded> {
 }
 
 /// `repository.candidates`: what `source` offers for `term`.
-fn candidates(source: &Map<String, Value>, term: &Value, deadline: Instant) -> Result<Vec<Candidate>> {
+fn candidates(source: &Map<String, Value>, term: &Value, language: Pronunciation, deadline: Instant) -> Result<Vec<Candidate>> {
     remaining(deadline)?;
     let kind = js::to_string(source.get("type"));
     if kind.starts_with("text-to-speech") {
         let voice = source.get("voice").filter(|voice| js::truthy(Some(voice)));
         return Ok(vec![Candidate {
             url: None,
-            name: voice.map_or_else(|| "Automatic Japanese".to_owned(), |voice| js::to_string(Some(voice))),
+            name: voice.map_or_else(|| format!("Automatic {}", language.name), |voice| js::to_string(Some(voice))),
         }]);
     }
     let Some(template) = source.get("url").filter(|url| js::truthy(Some(url))) else { return Ok(Vec::new()) };
-    let url = audio_source_url(&js::to_string(Some(template)), term)?;
+    let url = audio_source_url(&js::to_string(Some(template)), term, language)?;
     if kind == "custom" {
         return Ok(vec![Candidate { url: Some(url), name: String::new() }]);
     }
@@ -271,7 +291,13 @@ fn candidate_file(candidate: &Candidate, deadline: Instant) -> Result<(String, S
 /// The selection's `sourceKey` is the browser's `JSON.stringify(source)`, in the
 /// order the browser keeps the source's keys; `serde_json` keeps them sorted, so
 /// the source is compared as JSON (`sameJsonValue`) rather than as that text.
-fn selected_plan(sources: &[Value], term: &Value, selection: &Value, deadline: Instant) -> Result<(Value, Candidate)> {
+fn selected_plan(
+    sources: &[Value],
+    term: &Value,
+    selection: &Value,
+    language: Pronunciation,
+    deadline: Instant,
+) -> Result<(Value, Candidate)> {
     let key = selection.get("sourceKey").and_then(Value::as_str).and_then(|key| serde_json::from_str::<Value>(key).ok());
     let source = sources.iter().find(|source| {
         js::strict_eq(source.get("id"), selection.get("sourceId")) && key.as_ref().is_some_and(|key| js::same_json(key, source))
@@ -280,7 +306,7 @@ fn selected_plan(sources: &[Value], term: &Value, selection: &Value, deadline: I
     let Some(source) = source.filter(|_| current("expression") && current("reading")) else {
         return Err(Failure::new("This pronunciation selection is no longer current. Choose it again."));
     };
-    let offered = candidates(source.as_object().unwrap_or(&Map::new()), term, deadline)?;
+    let offered = candidates(source.as_object().unwrap_or(&Map::new()), term, language, deadline)?;
     let candidate = selection
         .get("index")
         .and_then(Value::as_f64)
@@ -299,12 +325,13 @@ fn selected_plan(sources: &[Value], term: &Value, selection: &Value, deadline: I
 }
 
 /// `exportAnkiAudio`: the first pronunciation the sources (or the reader's
-/// selection) offer that downloads.
-pub(crate) fn export(sources: &[Value], term: &Value, selection: Option<&Value>) -> Result<AudioFile> {
+/// selection) offer that downloads, in the pronunciation language of the
+/// note's profile.
+pub(crate) fn export(sources: &[Value], term: &Value, selection: Option<&Value>, language: Pronunciation) -> Result<AudioFile> {
     let deadline = Instant::now() + DEADLINE;
     let (sources, chosen) = match selection.filter(|selection| js::truthy(Some(selection))) {
         Some(selection) => {
-            let (source, candidate) = selected_plan(sources, term, selection, deadline)?;
+            let (source, candidate) = selected_plan(sources, term, selection, language, deadline)?;
             (vec![source], Some(candidate))
         }
         None => (sources.to_vec(), None),
@@ -319,7 +346,7 @@ pub(crate) fn export(sources: &[Value], term: &Value, selection: Option<&Value>)
         }
         let offered = match &chosen {
             Some(candidate) => vec![candidate.clone()],
-            None => match candidates(fields, term, deadline) {
+            None => match candidates(fields, term, language, deadline) {
                 Ok(offered) => offered,
                 Err(error) => {
                     remaining(deadline)?;
@@ -349,22 +376,86 @@ mod tests {
 
     use super::*;
 
+    /// A loopback server answering one request with `status`, `content_type`
+    /// and `body`; `None` for a URL nothing listens at.
+    fn answer(status: Option<u16>, content_type: &str, body: &'static [u8]) -> String {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/a", listener.local_addr().unwrap());
+        let Some(status) = status else { return url };
+        let content_type = content_type.to_owned();
+        std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let _ = socket.read(&mut [0u8; 4096]);
+            let head = format!(
+                "HTTP/1.1 {status} X\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = socket.write_all(head.as_bytes());
+            let _ = socket.write_all(body);
+        });
+        url
+    }
+
+    /// Upstream's audio-repository.test.mjs and anki-audio.test.mjs (#499):
+    /// each failure says which request failed, with its status or network error,
+    /// and a list and a recording saved as each other's type are explained.
+    #[test]
+    fn failures_say_which_request_failed() {
+        let term = json!({ "expression": "聞く", "reading": "きく" });
+        let deadline = || Instant::now() + DEADLINE;
+        let list = |url: String| json!({ "id": "list", "type": "url", "url": url });
+        let listed =
+            |source: Value| candidates(source.as_object().unwrap(), &term, Pronunciation::JAPANESE, deadline()).unwrap_err().message;
+        assert_eq!(listed(list(answer(Some(403), "text/plain", b""))), "The pronunciation list returned HTTP 403.");
+        assert_eq!(
+            listed(list(answer(Some(200), "audio/mpeg", b"ID3\x04"))),
+            "The pronunciation list is not JSON (audio/mpeg). If this URL plays a recording itself, set this source's type to Audio URL \
+             in Audio Settings."
+        );
+        let recording = |url: String| {
+            let source = json!({ "id": "rec", "type": "custom", "url": url });
+            export(&[source], &term, None, Pronunciation::JAPANESE).unwrap_err().message
+        };
+        assert_eq!(recording(answer(Some(404), "audio/mpeg", b"")), "The recording returned HTTP 404.");
+        // Nothing listens once the listener is dropped.
+        assert_eq!(recording(answer(None, "", b"")), "The recording could not be downloaded (Failed to fetch).");
+        assert_eq!(
+            recording(answer(Some(200), "application/json", br#"{"type":"audioSourceList","audioSources":[]}"#)),
+            "The URL returned a Yomitan audio list, not a recording. If it is a list link, set this source's type to Yomitan JSON in \
+             Audio Settings."
+        );
+    }
+
     #[test]
     fn fills_url_templates() {
         let term = json!({ "expression": "猫 (cat)!", "reading": "ねこ" });
         assert_eq!(
-            audio_source_url("https://a.test/{term}/{reading}?l={language}&x={other}&y={", &term).unwrap(),
+            audio_source_url("https://a.test/{term}/{reading}?l={language}&x={other}&y={", &term, Pronunciation::JAPANESE).unwrap(),
             "https://a.test/%E7%8C%AB%20%28cat%29%21/%E3%81%AD%E3%81%93?l=ja&x={other}&y={"
         );
+        // A profile's pack fills {language}; a language without one keeps Japanese.
+        for (code, expected) in [(Some("ar"), "ar"), (Some("grc"), "grc"), (Some("xx"), "ja"), (None, "ja")] {
+            assert_eq!(
+                audio_source_url("https://a.test/?l={language}", &term, Pronunciation::of(code)).unwrap(),
+                format!("https://a.test/?l={expected}")
+            );
+        }
+        let speech = json!({ "type": "text-to-speech", "voice": "" });
+        let names = |code| {
+            candidates(speech.as_object().unwrap(), &term, Pronunciation::of(code), Instant::now() + DEADLINE).unwrap()[0].name.clone()
+        };
+        assert_eq!(names(Some("en")), "Automatic English");
+        assert_eq!(names(None), "Automatic Japanese");
         assert_eq!(
-            audio_source_url("ftp://a.test/{term}", &term).unwrap_err().message,
+            audio_source_url("ftp://a.test/{term}", &term, Pronunciation::JAPANESE).unwrap_err().message,
             "Audio URLs must use HTTP(S) without a username or password."
         );
         assert_eq!(
-            audio_source_url("https://u:p@a.test/", &term).unwrap_err().message,
+            audio_source_url("https://u:p@a.test/", &term, Pronunciation::JAPANESE).unwrap_err().message,
             "Audio URLs must use HTTP(S) without a username or password."
         );
-        assert_eq!(audio_source_url("nope", &term).unwrap_err().message, "Invalid URL");
+        assert_eq!(audio_source_url("nope", &term, Pronunciation::JAPANESE).unwrap_err().message, "Invalid URL");
     }
 
     #[test]
@@ -377,11 +468,12 @@ mod tests {
         let selection = json!({ "sourceId": "s1", "sourceKey": key, "expression": "猫", "reading": "ねこ", "index": 0,
             "url": "https://a.test/%E7%8C%AB.mp3", "name": "" });
         let deadline = Instant::now() + DEADLINE;
-        let (chosen, candidate) = selected_plan(std::slice::from_ref(&source), &term, &selection, deadline).unwrap();
+        let (chosen, candidate) =
+            selected_plan(std::slice::from_ref(&source), &term, &selection, Pronunciation::JAPANESE, deadline).unwrap();
         assert_eq!((chosen, candidate.url.as_deref()), (source, Some("https://a.test/%E7%8C%AB.mp3")));
         // A source changed since the choice is not it.
         let changed = json!({ "id": "s1", "type": "custom", "url": "https://b.test/{term}.mp3", "enabled": true, "volume": 1 });
-        let error = selected_plan(&[changed], &term, &selection, deadline).unwrap_err();
+        let error = selected_plan(&[changed], &term, &selection, Pronunciation::JAPANESE, deadline).unwrap_err();
         assert_eq!(error.message, "This pronunciation selection is no longer current. Choose it again.");
     }
 

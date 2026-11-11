@@ -1,6 +1,6 @@
 [package]
 name = "hachidori-relay"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.88"
 license = "GPL-3.0-or-later"
@@ -28,7 +28,7 @@ default = ["cli"]
 cli = ["dep:clap", "dep:tracing-subscriber", "tokio/rt-multi-thread", "tokio/signal"]
 # Host mode: the relay is itself the sharing Hachidori, and mirrors a browser host's
 # configuration and dictionaries into a data directory (`--host`). Off by default.
-host = ["dep:ureq", "dep:icu_properties", "dep:zip", "zip/deflate-flate2", "dep:flate2", "dep:cmake", "dep:icu_collator", "dep:icu_normalizer", "dep:url", "dep:sha2", "dep:getrandom", "tokio/fs"]
+host = ["dep:ureq", "dep:icu_properties", "dep:zip", "zip/deflate-flate2", "dep:flate2", "dep:cmake", "dep:icu_collator", "dep:icu_normalizer", "dep:url", "dep:sha2", "dep:getrandom", "dep:stacker", "dep:serde_stacker", "serde_json/unbounded_depth", "tokio/fs"]
 
 [dependencies]
 base64 = "0.23.1"
@@ -48,7 +48,7 @@ tracing = "0.1.44"
 
 clap = { version = "4.6.7", optional = true, default-features = false, features = ["std", "help", "usage", "error-context", "derive", "suggestions"] }
 tracing-subscriber = { version = "0.3.23", optional = true, default-features = false, features = ["fmt", "env-filter", "ansi", "std"] }
-zip = { version = "9.3.0", default-features = false, optional = true }
+zip = { version = "9.5.1", default-features = false, optional = true }
 # Uploaded dictionaries are deflated ZIPs; the relay reads their index.json.
 flate2 = { version = "1.1", optional = true, default-features = false, features = ["rust_backend"] }
 icu_collator = { version = "2.4.0", optional = true }
@@ -59,13 +59,19 @@ ureq = { version = "3.5.1", optional = true, default-features = false, features 
 url = { version = "2.5.8", optional = true }
 sha2 = { version = "0.11.1", optional = true }
 getrandom = { version = "0.4.3", optional = true }
+# Structured content has a node limit but no depth limit, as in the extension: deep
+# glossaries are parsed and walked on a stack that grows onto the heap.
+stacker = { version = "0.1.25", optional = true }
+serde_stacker = { version = "0.1.14", optional = true }
 
 [build-dependencies]
 cmake = { version = "0.1.58", optional = true }
+# The language packs host mode ships, deflated into the binary.
+flate2 = { version = "1.1", optional = true, default-features = false, features = ["rust_backend"] }
 
 [dev-dependencies]
-tokio = { version = "1.54.1", features = ["full"] }
-zip = { version = "9.3.0", default-features = false }
+tokio = { version = "1.54.1", features = ["full", "test-util"] }
+zip = { version = "9.5.1", default-features = false }
 
 [lints.rust]
 # Allowed only in src/host/engine/ffi.rs, the one FFI module.

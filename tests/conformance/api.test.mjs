@@ -7,9 +7,7 @@ import { createServer } from "node:net";
 import test from "node:test";
 import { RELAY_VERSION, startAnkiRelayServer } from "./anki-relay-server.mjs";
 import { CAPABILITY, FIXTURES, startFakeHost } from "./fake-host.mjs";
-import { connectClient, untilKind } from "./relay-socket.mjs";
-
-const sleep = (ms) => new Promise((resolveSleep) => setTimeout(resolveSleep, ms));
+import { SLOW_TEST, connectClient, connectHost, eventually, untilKind } from "./relay-socket.mjs";
 
 async function server(t, options = {}) {
   const started = await startAnkiRelayServer({ pingMs: 50, apiPort: 0, ...options });
@@ -77,8 +75,8 @@ test("the WebSocket relay behaves as before while the API is enabled", async (t)
   const { port, apiPort } = await server(t);
   assert.notEqual(port, apiPort);
   assert.equal((await connectClient(t, port, "/link")).status, 503);
-  const host = await connectClient(t, port, "/host");
-  assert.deepEqual(await host.json(), { kind: "listening", port });
+  const host = await connectHost(t, port);
+  assert.deepEqual(host.listening, { kind: "listening", port });
   const link = await connectClient(t, port, "/link");
   assert.equal(link.status, 101);
   const opened = await untilKind(host, "client-open");
@@ -106,7 +104,6 @@ test("yomitanVersion is 503 without a host, 501 without the capability, and 200 
   assert.equal(old.opens.length, 1);
   old.destroy();
   await old.closed;
-  await sleep(100);
   const host = await startFakeHost(t, port);
   const body = await expectJson(await http.post("/yomitanVersion"), 200);
   assert.deepEqual(body, { version: FIXTURES.hostHello.version });
@@ -210,9 +207,22 @@ test("lookup endpoints forward to hd_api_* and answer in Yomitan's shapes", asyn
   assert.equal(host.requests.at(-1).message.parser, "scanning-parser", "the parser defaults like Yomitan's");
   await expectJson(await http.post("/tokenize", { text: "x" }), 400);
   await expectJson(await http.post("/tokenize", { text: "x", scanLength: "10" }), 400);
+
+  // A numeric profileIndex selects the language profile every profiled request
+  // answers from (Hachidori's docs/languages.md 12); anything else is profile 0.
+  for (const [path, body, type] of [["/termEntries", { term: "分かる" }, "hd_api_term_entries"],
+    ["/kanjiEntries", { character: "分" }, "hd_api_kanji_entries"],
+    ["/ankiFields", { text: "x", type: "kanji", markers: ["character"] }, "hd_api_anki_fields"],
+    ["/tokenize", { text: "猫", scanLength: 5 }, "hd_api_tokenize"]]) {
+    await http.post(path, { ...body, profileIndex: 1 });
+    assert.equal(host.requests.at(-1).message.type, type);
+    assert.equal(host.requests.at(-1).message.profileIndex, 1, path);
+    await http.post(path, { ...body, profileIndex: "1" });
+    assert.equal(Object.hasOwn(host.requests.at(-1).message, "profileIndex"), false, path);
+  }
 });
 
-test("a host error is 500 with an error body, large replies stream through, and concurrent requests keep their own replies", { timeout: 30000 }, async (t) => {
+test("a host error is 500 with an error body, large replies stream through, and concurrent requests keep their own replies", SLOW_TEST, async (t) => {
   const { port, apiPort } = await server(t);
   const http = api(apiPort);
   const big = "大きな".repeat(Math.ceil(10 * 1024 * 1024 / 9));
@@ -252,7 +262,6 @@ test("GET /dictionaries lists the host's catalogue and has the same host-state e
   assert.equal((await http.get("/dictionaries")).status, 501);
   old.destroy();
   await old.closed;
-  await sleep(100);
   const host = await startFakeHost(t, port, { files: new Map([["jitendex", Buffer.alloc(20 * 1024 * 1024)], ["kanjidic", Buffer.alloc(4096)]]) });
   const listed = await expectJson(await http.get("/dictionaries"), 200);
   assert.deepEqual(listed, FIXTURES.hd_api_dictionaries.reply);
@@ -263,7 +272,7 @@ test("GET /dictionaries lists the host's catalogue and has the same host-state e
 
 const sha256 = (buffer) => createHash("sha256").update(buffer).digest("hex");
 
-test("GET /dictionaries/<id> streams the archive in chunks with the right headers and closes the token", { timeout: 60000 }, async (t) => {
+test("GET /dictionaries/<id> streams the archive in chunks with the right headers and closes the token", SLOW_TEST, async (t) => {
   const { port, apiPort } = await server(t);
   const http = api(apiPort);
   const payload = randomBytes(20 * 1024 * 1024);
@@ -294,7 +303,7 @@ test("GET /dictionaries/<id> streams the archive in chunks with the right header
   assert.equal(await encoded.text(), "small");
 });
 
-test("downloads without a reported size, with short host chunks, and with non-ASCII names still arrive whole", { timeout: 30000 }, async (t) => {
+test("downloads without a reported size, with short host chunks, and with non-ASCII names still arrive whole", SLOW_TEST, async (t) => {
   const { port, apiPort } = await server(t);
   const http = api(apiPort);
   const payload = randomBytes(3 * 1024 * 1024 + 17);
@@ -313,7 +322,7 @@ test("downloads without a reported size, with short host chunks, and with non-AS
   await host.until((current) => current.closedTokens.length === 1, "the close request");
 });
 
-test("a client that aborts a download still causes close for its token, and two downloads do not interleave", { timeout: 60000 }, async (t) => {
+test("a client that aborts a download still causes close for its token, and two downloads do not interleave", SLOW_TEST, async (t) => {
   const { port, apiPort } = await server(t);
   const http = api(apiPort);
   const first = randomBytes(12 * 1024 * 1024);
@@ -330,7 +339,7 @@ test("a client that aborts a download still causes close for its token, and two 
   await reader.read();
   controller.abort();
   await assert.rejects(reader.read(), /abort/iu);
-  await host.until((current) => current.closedTokens.length === 1, "close after the client abort", 15000);
+  await host.until((current) => current.closedTokens.length === 1, "close after the client abort");
   assert.equal(host.openTokens.size, 0);
 
   const [one, two] = await Promise.all([http.get("/dictionaries/a"), http.get("/dictionaries/b")]);
@@ -340,7 +349,7 @@ test("a client that aborts a download still causes close for its token, and two 
   await host.until((current) => current.closedTokens.length === 3, "both closes");
 });
 
-test("a chunk read the host answers with an error ends the response short of its length, and the token is closed", { timeout: 30000 }, async (t) => {
+test("a chunk read the host answers with an error ends the response short of its length, and the token is closed", SLOW_TEST, async (t) => {
   const { port, apiPort } = await server(t);
   const http = api(apiPort);
   const payload = randomBytes(6 * 1024 * 1024);
@@ -364,8 +373,8 @@ test("a chunk read the host answers with an error ends the response short of its
   await host.until((current) => current.closedTokens.length === 1, "the close request");
 });
 
-test("a chunk read the host never answers ends the response short of its length, and the token is still closed", { timeout: 30000 }, async (t) => {
-  const { port, apiPort } = await server(t, { apiTimeoutSeconds: 1 });
+test("a chunk read the host never answers ends the response short of its length, and the token is still closed", SLOW_TEST, async (t) => {
+  const { port, apiPort } = await server(t, { apiTimeoutSeconds: 3 });
   const http = api(apiPort);
   const payload = randomBytes(6 * 1024 * 1024);
   let reads = 0;
@@ -386,24 +395,24 @@ test("a chunk read the host never answers ends the response short of its length,
     for await (const chunk of response.body) received += chunk.length;
   })(), (error) => error instanceof TypeError || /terminated|closed|aborted|ECONNRESET/iu.test(String(error.cause ?? error)));
   assert.equal(received, 4 * 1024 * 1024, "exactly the first chunk arrived");
-  assert.ok(Date.now() - started < 10000, "the timeout, not the client, ended it");
+  assert.ok(Date.now() - started < 30_000, "the timeout, not the client, ended it");
   await host.until((current) => current.closedTokens.length === 1, "the close request");
   assert.equal(host.openTokens.size, 0);
 });
 
-test("a host that opens a dictionary after the relay stopped waiting gets 504 answered and its token closed", { timeout: 30000 }, async (t) => {
-  const { port, apiPort } = await server(t, { apiTimeoutSeconds: 0.5 });
+test("a host that opens a dictionary after the relay stopped waiting gets 504 answered and its token closed", SLOW_TEST, async (t) => {
+  const { port, apiPort } = await server(t, { apiTimeoutSeconds: 2 });
   const http = api(apiPort);
   const host = await startFakeHost(t, port, {
     files: new Map([["kanjidic", Buffer.from("late archive")]]),
     respond(message, current, defaults) {
       if (message.type !== "hd_api_dictionary_open") return undefined;
-      return new Promise((resolveLater) => setTimeout(() => resolveLater(defaults(message, current)), 1200));
+      return new Promise((resolveLater) => setTimeout(() => resolveLater(defaults(message, current)), 6000));
     },
   });
   const late = await expectJson(await http.get("/dictionaries/kanjidic"), 504);
   assert.match(late.error, /did not answer/u);
-  await host.until((current) => current.closedTokens.length === 1, "close for the late token", 10000);
+  await host.until((current) => current.closedTokens.length === 1, "close for the late token");
   assert.equal(host.closedTokens[0], "dl-1");
   assert.equal(host.openTokens.size, 0, "the lease the host granted too late is released");
   assert.deepEqual(await expectJson(await http.post("/yomitanVersion"), 200), { version: FIXTURES.hostHello.version }, "the session is still usable");
@@ -437,7 +446,7 @@ async function nonLoopbackAddress(t, host) {
   return reply.addresses[0].address;
 }
 
-test("the API follows the host's network switch and returns to this computer when the host leaves", { timeout: 30000 }, async (t) => {
+test("the API follows the host's network switch and returns to this computer when the host leaves", SLOW_TEST, async (t) => {
   const { port, apiPort } = await server(t);
   const host = await startFakeHost(t, port);
   const address = await nonLoopbackAddress(t, host);
@@ -458,12 +467,11 @@ test("the API follows the host's network switch and returns to this computer whe
   assert.equal((await remote.post("/serverVersion")).status, 200);
   host.destroy();
   await host.closed;
-  await sleep(300);
-  await assert.rejects(remote.post("/serverVersion"), /ECONNREFUSED|fetch failed/u, "host loss returns the API to this computer");
+  await eventually("host loss returning the API to this computer", () => assert.rejects(remote.post("/serverVersion"), /ECONNREFUSED|fetch failed/u));
   assert.equal((await api(apiPort).post("/serverVersion")).status, 200);
 });
 
-test("a download in flight survives a network rebind", { timeout: 60000 }, async (t) => {
+test("a download in flight survives a network rebind", SLOW_TEST, async (t) => {
   const { port, apiPort } = await server(t);
   const http = api(apiPort);
   const payload = randomBytes(16 * 1024 * 1024);
@@ -487,6 +495,6 @@ test("an occupied API port leaves the relay running and is reported", async (t) 
   t.after(() => relay.close());
   assert.equal(relay.apiPort, null);
   assert.match(relay.apiError, /in use|Address/iu);
-  const host = await connectClient(t, relay.port, "/host");
-  assert.deepEqual(await host.json(), { kind: "listening", port: relay.port });
+  const host = await connectHost(t, relay.port);
+  assert.deepEqual(host.listening, { kind: "listening", port: relay.port });
 });

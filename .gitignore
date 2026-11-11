@@ -3,3 +3,6 @@
 /relay.local.json
 /tests/conformance/node_modules
 /host-data
+
+# Hachidori checkout for the oracle suites (CI)
+/.hachidori/

@@ -13,11 +13,13 @@ use std::sync::{Mutex, PoisonError};
 use serde_json::{Map, Value, json};
 
 use super::import::{empty_report, optional_text, with_stored_presentation};
-use super::mutations::{ImportError, Result, STORAGE_ATTEMPTS, Session, dictionary_state, error_or, import_error, is_true, list, paths};
+use super::mutations::{
+    ImportError, Joining, Result, STORAGE_ATTEMPTS, Session, dictionary_state, error_or, import_error, is_true, list, paths,
+};
 use super::{Engine, failure_reply, object, package, text};
 use crate::host::js::{self, strict_eq};
 use crate::host::remote::{self, Fetch, MANAGED_DICTIONARY_CHANGED, Recommended};
-use crate::host::settings::custom::CUSTOM_DICTIONARY_TITLE;
+use crate::host::settings::custom;
 use crate::host::settings::worker::Storage;
 
 /// The phases a failure is reported in.
@@ -28,6 +30,17 @@ const IMPORTING: &str = "importing the dictionary";
 pub(crate) const IMPORT_IN_PROGRESS: &str = "another dictionary import is already in progress";
 /// Where the archive waits while it downloads.
 const DOWNLOAD_KEY: &str = "remote-import";
+/// `PROGRESS_INTERVAL_MS`: the least time between download reports.
+const PROGRESS_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// An import's progress, as the engine reports it to the installer that issued it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Progress {
+    /// `{phase: "downloading", receivedBytes, totalBytes}`.
+    Downloading { received: u64, total: Option<u64> },
+    /// `{phase: "installing"}`: the archive is staged and compiling.
+    Installing,
+}
 
 /// A managed update's checked source (`managedSourceForImport`).
 struct Managed {
@@ -174,8 +187,8 @@ fn replacement_index(stored: &[Value], generated: &Value, prepared: &Prepared) -
 /// `withImport`: `stored` with `generated` added, or replacing the package it updates.
 fn with_import(stored: &[Value], generated: &Value, prepared: &Prepared) -> Result<Vec<Value>> {
     let title = text(generated.get("title"));
-    if title == CUSTOM_DICTIONARY_TITLE {
-        return Err(format!("{CUSTOM_DICTIONARY_TITLE} is reserved for the managed custom dictionary"));
+    if custom::is_personal_title(title) {
+        return Err(format!("{title} is reserved for the managed custom dictionary"));
     }
     let Some(index) = replacement_index(stored, generated, prepared)? else {
         let added = match prepared.recommended {
@@ -211,7 +224,7 @@ fn with_import(stored: &[Value], generated: &Value, prepared: &Prepared) -> Resu
 }
 
 /// `fetchImportArchive` and `stageImportArchive`: the archive, written to `path`.
-fn download(fetch: &dyn Fetch, prepared: &Prepared, path: &Path) -> Result<()> {
+fn download(fetch: &dyn Fetch, prepared: &Prepared, path: &Path, progress: &dyn Fn(Progress)) -> Result<()> {
     let name = &prepared.file_name;
     let response = fetch.get(&prepared.archive_url, None)?;
     if !(200..300).contains(&response.status) {
@@ -224,8 +237,29 @@ fn download(fetch: &dyn Fetch, prepared: &Prepared, path: &Path) -> Result<()> {
     if !trusted {
         return Err(format!("{name} downloaded from an unexpected final URL"));
     }
-    let mut body = response.body;
-    let written = File::create(path).and_then(|mut file| io::copy(&mut body, &mut file));
+    let (mut body, total) = (response.body, response.total);
+    // `consumeResponse`: a report at most every interval, and one at the end.
+    let report = |received: u64| progress(Progress::Downloading { received, total: total.filter(|total| received <= *total) });
+    let written = File::create(path).and_then(|mut file| {
+        let mut buffer = vec![0u8; 64 * 1024];
+        let (mut received, mut reported) = (0u64, None::<std::time::Instant>);
+        loop {
+            let read = match io::Read::read(&mut body, &mut buffer) {
+                Ok(0) => break,
+                Ok(read) => read,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            };
+            io::Write::write_all(&mut file, &buffer[..read])?;
+            received += read as u64;
+            if reported.is_none_or(|at| at.elapsed() >= PROGRESS_INTERVAL) {
+                reported = Some(std::time::Instant::now());
+                report(received);
+            }
+        }
+        report(received);
+        Ok(received)
+    });
     match written {
         Ok(0) => Err(format!("{name} is empty")),
         Ok(_) => Ok(()),
@@ -237,7 +271,15 @@ fn download(fetch: &dyn Fetch, prepared: &Prepared, path: &Path) -> Result<()> {
 impl Engine {
     /// `hd_import` of a remote archive. `lock` is the storage lock, taken to read the
     /// request's sources and again to commit, but not while the archive downloads.
-    pub(crate) fn import_remote(&self, storage: &impl Storage, lock: &Mutex<()>, fetch: &dyn Fetch, message: &Value) -> Value {
+    /// `progress` hears the download and the start of the installation.
+    pub(crate) fn import_remote(
+        &self,
+        storage: &impl Storage,
+        lock: &Mutex<()>,
+        fetch: &dyn Fetch,
+        message: &Value,
+        progress: &dyn Fn(Progress),
+    ) -> Value {
         let request_id = message.get("requestId").cloned().unwrap_or(Value::Null);
         let thrown = |error: ImportError| {
             let mut reply = failure_reply("hd_import", &request_id, &error.message, &self.lock());
@@ -259,10 +301,11 @@ impl Engine {
             Err(error) => return thrown(import_error(name, &error, CHECKING)),
         };
         let archive = self.store.download_file(DOWNLOAD_KEY);
-        if let Err(error) = download(fetch, &prepared, &archive) {
+        if let Err(error) = download(fetch, &prepared, &archive, progress) {
             let _ = fs::remove_file(&archive);
             return thrown(import_error(&prepared.file_name, &error, READING));
         }
+        progress(Progress::Installing);
         let reply = {
             let _serialised = lock.lock().unwrap_or_else(PoisonError::into_inner);
             self.run(storage, "hd_import", &request_id, |session| Ok(session.import_remote(&archive, &prepared, message)))
@@ -336,16 +379,22 @@ impl<S: Storage> Session<'_, S> {
             let counts = (js::to_number(report.get("termCount")), js::to_number(report.get("frequencyCount")));
             remote::assert_recommended(source, &title, &generated["indexUrl"], &generated["revision"], counts)?;
         }
-        if title == CUSTOM_DICTIONARY_TITLE {
-            return Err(format!("{CUSTOM_DICTIONARY_TITLE} is reserved for the managed custom dictionary"));
+        if custom::is_personal_title(&title) {
+            return Err(format!("{title} is reserved for the managed custom dictionary"));
         }
         for attempt in 0..STORAGE_ATTEMPTS {
             let state = self.dictionary_state()?;
             let stored = list(state.get("dictionaries")).to_vec();
             let next = with_import(&stored, &generated, prepared)?;
             let candidate = self.preload(&next, &paths(&stored))?;
-            let base = state.get("revision").filter(|revision| !revision.is_null()).cloned().unwrap_or(json!(0));
-            let reply = self.commit_state(&base, &next);
+            // Managed updates name no profile, so they leave every profile's list as it is.
+            let reply = match self.commit_state(&state, &next, &Joining::JAPANESE) {
+                Ok(reply) => reply,
+                Err(error) => {
+                    let _ = self.restore();
+                    return Err(error);
+                }
+            };
             if is_true(&reply, "ok") {
                 let committed = reply.get("state");
                 if !strict_eq(committed.and_then(|state| state.get("schemaVersion")), Some(&json!(1)))

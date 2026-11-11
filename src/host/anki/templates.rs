@@ -43,6 +43,8 @@ const CORE_MARKERS: &[&str] = &[
     "document-title",
     "url",
     "url-plain",
+    // `miscInfo`, compared lower-cased as every name is.
+    "miscinfo",
     "sentence",
     "sentence-furigana",
     "sentence-furigana-plain",

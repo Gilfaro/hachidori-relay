@@ -13,10 +13,13 @@ use sha2::{Digest, Sha256};
 use super::audio::{self, AudioFile};
 use super::duplicates::{self, Fields, Note, Templates};
 use super::gateway::{Failure, Result};
-use super::glossary::Renderer;
+use super::glossary::{Layout, Renderer};
+use super::language::NoteLanguage;
 use super::media::DictionaryMedia;
-use super::{Anki, CONFIG_CHANGED, Configured, Invoke, index, templates, values};
+use super::{Anki, CONFIG_CHANGED, Configured, Invoke, OPTIONS_KEY, index, split_code, templates, values};
+use crate::host::profile::JAPANESE;
 use crate::host::settings::hex;
+use crate::host::settings::{profile_worker, profiles};
 use crate::host::{js, store};
 
 const IMAGE_EXTENSIONS: [&str; 10] = ["png", "jpg", "jpeg", "gif", "webp", "svg", "avif", "bmp", "ico", "tiff"];
@@ -131,6 +134,28 @@ fn addable_decision(invoke: &Invoke<'_>, prepared: &Prepared) -> Result<Decision
     Ok(checked_decision(invoke, prepared, addable, error))
 }
 
+/// `nativeDuplicateCheck`: Anki's own first-field duplicate guard is enough for
+/// this Template. Overwrite, and expression fields elsewhere in a custom model,
+/// still need the word index and exact target fields; cross-model scopes keep
+/// their policy.
+pub(super) fn native_check(current: &Configured) -> bool {
+    let text = |key: &str| current.config.get(key).and_then(Value::as_str);
+    let first = current.discovery.as_ref().and_then(|discovery| discovery.fields.first());
+    let template = first.and_then(|field| current.resolved.as_ref().map(|resolved| resolved.value(field))).unwrap_or_default();
+    text("duplicateScope") == Some("model")
+        && text("duplicateBehavior") != Some("overwrite")
+        && template.eq_ignore_ascii_case("{expression}")
+}
+
+/// `nativeDecision`: a duplicate as Anki's add check reports it, without the index.
+fn native_decision(invoke: &Invoke<'_>, prepared: &Prepared) -> Result<Decision> {
+    let checked = duplicates::check_duplicate(invoke, &prepared.note)?;
+    if checked.duplicate {
+        return Ok(duplicate(behavior(prepared) == "new", Vec::new(), false));
+    }
+    Ok(checked_decision(invoke, prepared, checked.addable, checked.error))
+}
+
 fn behavior(prepared: &Prepared) -> &str {
     prepared.current.config.get("duplicateBehavior").and_then(Value::as_str).unwrap_or_default()
 }
@@ -171,6 +196,9 @@ impl Anki {
         if request.get("allowDuplicate") == Some(&Value::Bool(true)) {
             return Ok(Decision { state: "addable", can_add: true, ..Decision::default() });
         }
+        if native_check(&prepared.current) {
+            return native_decision(invoke, prepared);
+        }
         let config = &prepared.current.config;
         let expression = request["term"].get("expression").or_else(|| request.get("expression")).filter(|value| !value.is_null());
         let Some(source) = index::source(config) else { return unindexed_decision(invoke, prepared) };
@@ -200,7 +228,10 @@ impl Anki {
 
     /// One engine request, its reply's error as a failure.
     pub(super) fn engine(&self, message: &Value) -> Result<Value> {
-        let reply = self.engine.handle(message);
+        let (options, state) = (self.publisher.read(OPTIONS_KEY), self.publisher.read(store::DICTIONARY_STATE));
+        let message =
+            profile_worker::engine_request(message, options.as_ref(), state.as_ref()).map_err(|refused| Failure::new(refused.error))?;
+        let reply = self.engine.handle(&message);
         if reply.get("ok") == Some(&Value::Bool(true)) {
             Ok(reply)
         } else {
@@ -222,9 +253,12 @@ impl Anki {
         Ok(())
     }
 
-    /// `readDictionaries`, as `dictionaryPaths`: each enabled dictionary's generation path.
-    fn dictionary_paths(&self) -> HashMap<String, String> {
-        let state = self.publisher.read(store::DICTIONARY_STATE).unwrap_or(Value::Null);
+    /// `readDictionaries`, as `dictionaryPaths`: each enabled dictionary's
+    /// generation path, in the dictionaries of the request's profile.
+    fn dictionary_paths(&self, request: &Value) -> HashMap<String, String> {
+        let profile_id = request.get("profileId").and_then(Value::as_str).unwrap_or(JAPANESE);
+        let state = self.publisher.read(store::DICTIONARY_STATE);
+        let state = profiles::project_dictionary_state(state.as_ref(), profile_id).unwrap_or(Value::Null);
         state
             .get("dictionaries")
             .and_then(Value::as_array)
@@ -245,12 +279,21 @@ impl Anki {
         if !wanted {
             return Ok(None);
         }
-        let options = self.options();
+        // A profile's sentence is split in its language, and not at all in one
+        // without ruby.
+        let profile_id = request.get("profileId").and_then(Value::as_str);
+        let (options, profile) = self.options_and_profile(profile_id).map_err(|error| Failure::new(split_code(&error).0))?;
+        if let Some(profile) = &profile {
+            let pack_settings = profile.get("packSettings").and_then(Value::as_object).cloned().unwrap_or_default();
+            if !profiles::option_requirement_met(&Value::from("ruby"), profile["language"].as_str(), &pack_settings) {
+                return Ok(None);
+            }
+        }
         let sentence = js::to_string(request.get("sentence"));
         let offset = js::to_number(request.get("matchOffset"));
         #[expect(clippy::cast_precision_loss, reason = "a UTF-16 length")]
         let end = offset + js::length(request.get("matched").and_then(Value::as_str).unwrap_or_default()) as f64;
-        let reply = self.engine(&json!({
+        let mut segment = json!({
             "type": "hd_segment",
             "chunks": [{ "id": 0, "text": js::slice(&sentence, 0.0, Some(offset)) }, { "id": 1, "text": js::slice(&sentence, end, None) }],
             "scanLength": options.get("scanLength"),
@@ -259,27 +302,39 @@ impl Anki {
                 "frequencyOrder": options.get("frequencyOrder"),
                 "personalDictionary": options.get("personalDictionaryEnabled"),
             },
-        }))?;
+        });
+        if let Some(id) = profile_id {
+            segment["profileId"] = Value::from(id);
+        }
+        let reply = self.engine(&segment)?;
         let segments = reply.get("segments").and_then(Value::as_array).ok_or_else(|| Failure::new("hd_segment returned no segments."))?;
         Ok(Some(Value::Array(segments.iter().map(|segment| segment.get("spans").cloned().unwrap_or(Value::Null)).collect())))
     }
 
-    /// `audio`: the pronunciation the enabled sources offer for the result.
+    /// `audio`: the pronunciation the enabled sources offer for the result, in
+    /// the language of the profile the note is mined in.
     pub(super) fn audio(request: &Value, config: &Map<String, Value>) -> Result<AudioFile> {
         let sources = config.get("audioSources").and_then(Value::as_array).cloned().unwrap_or_default();
-        audio::export(&sources, &request["term"], request.get("audioSelection"))
+        let language = audio::Pronunciation::of(config.get("profile").and_then(|profile| profile["language"].as_str()));
+        audio::export(&sources, &request["term"], request.get("audioSelection"), language)
     }
 
     /// `buildFields`: the fields the request's Templates make, and what they need.
-    pub(super) fn build_fields(&self, request: &Value, current: &Configured) -> Result<(Fields, Resources)> {
+    pub(super) fn build_fields(&self, request: &Value, current: &Configured, preflight: bool) -> Result<(Fields, Resources)> {
         if !valid_result(request) {
             return Err(Failure::new("Mining requires a current dictionary result."));
         }
-        self.current_generation(request)?;
         let (Some(discovery), Some(resolved)) = (&current.discovery, &current.resolved) else {
             return Err(Failure::new("Choose an Anki note type in Settings."));
         };
         let first = discovery.fields.first().map(|field| resolved.value(field)).unwrap_or_default();
+        if preflight && resolved.templates.len() == 1 && first.eq_ignore_ascii_case("{expression}") {
+            // No dictionary reads or engine status just to ask Anki about a word
+            // this lookup already supplied.
+            let mut definition = |_: &super::glossary::Wanted| Ok(String::new());
+            return Ok((values::build_fields(request, &resolved.templates, &mut definition, "", None)?, Resources::default()));
+        }
+        self.current_generation(request)?;
         let sources = current.config.get("audioSources").and_then(Value::as_array).is_some_and(|sources| !sources.is_empty());
         let mut resources = Resources::default();
         // Audio in the first field is part of Anki's duplicate identity, so it is
@@ -288,8 +343,8 @@ impl Anki {
             resources.audio = Some(Self::audio(request, &current.config)?);
         }
         let pronunciation = resources.audio.as_ref().map(|file| format!("[sound:{}]", file.filename)).unwrap_or_default();
-        let compact = current.config.get("compactGlossary") == Some(&Value::Bool(true));
-        let (fields, media) = self.render(request, &resolved.templates, &pronunciation, compact)?;
+        let (fields, media) =
+            self.render(request, &resolved.templates, &pronunciation, Layout::of(&current.config), current.config.get("profile"))?;
         resources.media = media;
         Ok((fields, resources))
     }
@@ -301,25 +356,30 @@ impl Anki {
         request: &Value,
         templates: &Templates,
         audio: &str,
-        compact: bool,
+        layout: Layout,
+        profile: Option<&Value>,
     ) -> Result<(Fields, Vec<DictionaryMedia>)> {
         let segments = self.sentence_segments(request, templates)?;
         let mut request = request.clone();
         if let Some(segments) = segments {
             request["sentenceSegments"] = segments;
         }
-        self.render_plain(&request, templates, audio, compact)
+        self.render_plain(&request, templates, audio, layout, profile)
     }
 
-    /// The offscreen document's `hd_anki_fields`: the fields for a request as it is.
+    /// The offscreen document's `hd_anki_fields`: the fields for a request as
+    /// it is, in the language of `profile` (`{language, packSettings}`) once
+    /// the records have profiles.
     pub(super) fn render_plain(
         &self,
         request: &Value,
         templates: &Templates,
         audio: &str,
-        compact: bool,
+        layout: Layout,
+        profile: Option<&Value>,
     ) -> Result<(Fields, Vec<DictionaryMedia>)> {
-        let paths = self.dictionary_paths();
+        let language = NoteLanguage::of(profile, request);
+        let paths = self.dictionary_paths(request);
         let generation = request.get("generation").cloned();
         let styles =
             Box::new(move || {
@@ -346,16 +406,16 @@ impl Anki {
             None => Err(Failure::new(format!("The dictionary generation is no longer available: {dictionary}"))),
         });
         let fields = {
-            let mut renderer = Renderer::new(request, compact, styles, filename_for);
+            let mut renderer = Renderer::new(request, layout, styles, filename_for).in_language(language.as_ref());
             let mut definition = |wanted: &_| renderer.render(wanted);
-            values::build_fields(request, templates, &mut definition, audio)?
+            values::build_fields(request, templates, &mut definition, audio, language.as_ref())?
         };
         Ok((fields, planned.into_inner()))
     }
 
     /// `prepare`: the request's note, from a configuration that still matches it.
     pub(super) fn prepare(&self, request: &Value, fresh: bool) -> std::result::Result<Prepared, String> {
-        let current = self.configuration(request.get("templateId"), fresh)?;
+        let current = self.configuration(request.get("templateId"))?;
         if request.get("configKey").and_then(Value::as_str) != Some(current.config_key.as_str()) {
             return Err(CONFIG_CHANGED.to_owned());
         }
@@ -363,7 +423,22 @@ impl Anki {
             return Err(current.errors.join("\n"));
         }
         let config_json = Value::Object(current.config.clone()).to_string();
-        let (fields, resources) = self.build_fields(request, &current).map_err(|error| error.message)?;
+        // Only authored cloze templates besides the first field can affect Anki's
+        // validity check, so a native add check renders just those: glossaries and
+        // sentence furigana are not needed to enable Add.
+        let built = if !fresh && native_check(&current) {
+            let mut rendering = current.clone();
+            if let (Some(resolved), Some(first)) = (&mut rendering.resolved, current.discovery.as_ref().and_then(|d| d.fields.first())) {
+                resolved.templates.retain(|(field, template)| {
+                    field == first
+                        || template.get("value").and_then(Value::as_str).is_some_and(|value| value.to_lowercase().contains("{{c"))
+                });
+            }
+            self.build_fields(request, &rendering, true)
+        } else {
+            self.build_fields(request, &current, !fresh)
+        };
+        let (fields, resources) = built.map_err(|error| error.message)?;
         let first_field = current.discovery.as_ref().and_then(|discovery| discovery.fields.first()).cloned().unwrap_or_default();
         let config = &current.config;
         let model = config.get("model").and_then(Value::as_str).unwrap_or_default();
@@ -390,12 +465,22 @@ impl Anki {
                 tags.push(tag);
             }
         }
-        let note = Note { deck: js::to_string(config.get("deck")), model: model.to_owned(), fields, options, tags };
+        let note =
+            Note { deck: js::to_string(config.get("deck")), model: model.to_owned(), fields, options, tags, attachments: Map::new() };
         Ok(Prepared { current, config_json, note, first_field, resources })
     }
 
     /// `preflight`, for a linked browser: the decision and what the reader captures.
     pub(super) fn preflight(&self, request: &Value) -> std::result::Result<Map<String, Value>, String> {
+        let reply = self.preflight_reply(request);
+        // A failure, or a note Anki refuses, retires the configuration for a retry.
+        if reply.as_ref().is_err() || reply.as_ref().is_ok_and(|reply| reply.get("state") == Some(&json!("invalid"))) {
+            self.retire(request.get("templateId"));
+        }
+        reply
+    }
+
+    fn preflight_reply(&self, request: &Value) -> std::result::Result<Map<String, Value>, String> {
         let prepared = self.prepare(request, false)?;
         let invoke = self.config_invoker(&prepared.current.config);
         let decision = self.decision(&invoke, &prepared, request).map_err(|error| error.message)?;

@@ -11,6 +11,36 @@ export const EXTENSION_ORIGIN = "chrome-extension://hachidorirelaytestextensioni
 export const FIREFOX_ORIGIN = "moz-extension://5a1d4c2e-8f3b-4e6a-9c7d-0b1e2f3a4b5c";
 export const HOSHIDICTS_ORIGIN = "hoshi://hoshidicts";
 
+// Not in upstream: timing for loaded CI runners (macOS ones especially), where a fixed
+// sleep or a short wait loses races that a fast machine always wins. `WAIT_MS` bounds
+// every wait for something the relay should do, measured over the whole wait: the
+// relay's pings must not restart it, or a missing event only shows as the test's own
+// timeout. `SLOW_TEST` is the timeout for tests that move tens of MiB.
+export const WAIT_MS = 30_000;
+export const SLOW_TEST = { timeout: 180_000 };
+const sleep = (ms) => new Promise((resolveSleep) => setTimeout(resolveSleep, ms));
+
+// Rejects with `timed out waiting for <what>` if `promise` has not settled in `timeoutMs`.
+export function within(what, promise, timeoutMs = WAIT_MS) {
+  let timer;
+  const late = new Promise((_, rejectLate) => { timer = setTimeout(() => rejectLate(new Error(`timed out waiting for ${what}`)), timeoutMs); });
+  return Promise.race([promise, late]).finally(() => clearTimeout(timer));
+}
+
+// Retries `check` every 20 ms until it resolves, instead of sleeping a fixed time and
+// hoping the relay got there. Its last failure is rethrown at the deadline.
+export async function eventually(what, check, timeoutMs = WAIT_MS) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    try {
+      return await check();
+    } catch (error) {
+      if (Date.now() > deadline) throw new Error(`${what} never happened: ${error.message}`, { cause: error });
+    }
+    await sleep(20);
+  }
+}
+
 export function queue() {
   const items = [];
   const waiters = [];
@@ -21,7 +51,7 @@ export function queue() {
       else items.push(item);
     },
     drain() { return items.splice(0, items.length); },
-    next(what = "item", timeoutMs = 5000) {
+    next(what = "item", timeoutMs = WAIT_MS) {
       if (items.length > 0) return Promise.resolve(items.shift());
       return new Promise((resolveNext, rejectNext) => {
         const timer = setTimeout(() => rejectNext(new Error(`timed out waiting for ${what}`)), timeoutMs);
@@ -93,7 +123,7 @@ export async function connectClient(t, port, path, origin = EXTENSION_ORIGIN, ho
   ].join("\r\n"));
   const frames = queue();
   const listeners = [];
-  const closed = new Promise((resolveClose) => socket.once("close", resolveClose));
+  const closedOnce = new Promise((resolveClose) => socket.once("close", resolveClose));
   let buffer = Buffer.alloc(0);
   let status = null;
   // Not in upstream: chunks wait here until the frame they belong to is complete, so a
@@ -133,7 +163,10 @@ export async function connectClient(t, port, path, origin = EXTENSION_ORIGIN, ho
   await head;
   return {
     status,
-    closed,
+    // A getter, so that the deadline starts when a test begins to wait.
+    get closed() { return within("the socket to close", closedOnce); },
+    // Not in upstream: runs `listener` once the socket has closed, however long that takes.
+    onClose(listener) { closedOnce.then(listener); },
     pause() { socket.pause(); },
     resume() { socket.resume(); },
     // Routes every frame to `listener` instead of the queue (for the fake host's event loop).
@@ -144,10 +177,11 @@ export async function connectClient(t, port, path, origin = EXTENSION_ORIGIN, ho
     send(text) { socket.write(encodeClientFrame(0x1, Buffer.from(text, "utf8"))); },
     // Not in upstream: writes already-encoded bytes (for the limit tests).
     sendRaw(bytes) { socket.write(bytes); },
-    async ping(text) {
+    async ping(text, timeoutMs = WAIT_MS) {
       socket.write(encodeClientFrame(0x9, Buffer.from(text, "utf8")));
-      let frame = await frames.next("a pong frame");
-      while (frame.opcode !== 0xA) frame = await frames.next("a pong frame");
+      const deadline = Date.now() + timeoutMs;
+      let frame = await frames.next("a pong frame", deadline - Date.now());
+      while (frame.opcode !== 0xA) frame = await frames.next("a pong frame", deadline - Date.now());
       assert.equal(frame.payload.toString("utf8"), text);
     },
     async json(what = "a frame", timeoutMs = undefined) {
@@ -155,9 +189,10 @@ export async function connectClient(t, port, path, origin = EXTENSION_ORIGIN, ho
       assert.equal(frame.opcode, 0x1, `expected a text frame, got opcode ${frame.opcode}`);
       return JSON.parse(frame.payload.toString("utf8"));
     },
-    async closeFrame() {
-      let frame = await frames.next("a close frame");
-      while (frame.opcode !== 0x8) frame = await frames.next("a close frame");
+    async closeFrame(timeoutMs = WAIT_MS) {
+      const deadline = Date.now() + timeoutMs;
+      let frame = await frames.next("a close frame", deadline - Date.now());
+      while (frame.opcode !== 0x8) frame = await frames.next("a close frame", deadline - Date.now());
       return frame;
     },
     close() { socket.write(encodeClientFrame(0x8, Buffer.alloc(0))); },
@@ -165,8 +200,26 @@ export async function connectClient(t, port, path, origin = EXTENSION_ORIGIN, ho
   };
 }
 
-export async function untilKind(client, kind) {
-  let frame = await client.json(`a ${kind} frame`);
-  while (frame.kind !== kind) frame = await client.json(`a ${kind} frame`);
+export async function untilKind(client, kind, timeoutMs = WAIT_MS) {
+  const deadline = Date.now() + timeoutMs;
+  let frame = await client.json(`a ${kind} frame`, deadline - Date.now());
+  while (frame.kind !== kind) frame = await client.json(`a ${kind} frame`, deadline - Date.now());
   return frame;
+}
+
+// Not in upstream: connects a host and reads its `listening` frame (returned as
+// `listening`). A test that has just dropped the previous host can get here before the
+// relay has noticed; the relay then turns this one away as a second host, so it retries.
+// Tests of that refusal itself connect with `connectClient`.
+export async function connectHost(t, port, origin = EXTENSION_ORIGIN) {
+  return eventually("the relay taking a new host", async () => {
+    const socket = await connectClient(t, port, "/host", origin);
+    assert.equal(socket.status, 101);
+    const first = await socket.json("the listening frame");
+    if (first.kind !== "listening") {
+      socket.destroy();
+      assert.equal(first.kind, "listening", JSON.stringify(first));
+    }
+    return Object.assign(socket, { listening: first });
+  });
 }

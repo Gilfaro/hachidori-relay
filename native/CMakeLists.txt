@@ -33,7 +33,9 @@ if(MSVC)
 endif()
 
 add_library(hachidori_native STATIC bindings.cpp)
-target_link_libraries(hachidori_native PRIVATE hoshidicts glaze::glaze)
+# The language-pack headers bindings.cpp reads (hdw_language_load, hdw_segment,
+# hdw_deinflect) include unordered_dense's, a header-only library.
+target_link_libraries(hachidori_native PRIVATE hoshidicts glaze::glaze unordered_dense::unordered_dense)
 # hdw_import reads an archive's title through the engine's private zip reader.
 target_include_directories(hachidori_native PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../third_party/hoshidicts/src)
 if(MSVC)

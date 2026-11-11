@@ -66,9 +66,10 @@ AnkiConnect: the duplicate index, word status, "open in Anki", the add check, an
 overwriting notes with their fields rendered from the Templates, dictionary images, pronunciations
 and screenshots (also for the HTTP API's `ankiFields`), and managed dictionary updates with their
 schedule, and installing the recommended dictionaries, both downloaded by the relay. [docs/host-mode.md](docs/host-mode.md)
-describes it. It is compatible with Hachidori
-[`d959a09`](https://github.com/bee-san/hachidori/commit/d959a09810cbbcbf8a6113a154a45dfb2f0a88ae)
-(Japanese only: it shares as a Japanese-only browser host does, without language profiles).
+describes it. It follows Hachidori 0.5.1
+[`d41c37a`](https://github.com/bee-san/hachidori/commit/d41c37abe4ea54ef6ec885e9517bbf5655f3d718)
+with language profiles: it hosts every language pack the extension ships, and
+shares, mines and answers the HTTP API per profile, as a 0.5.1 browser host does.
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
@@ -134,8 +135,9 @@ fake host, changed only to start this binary and expect its version. Helpers tha
 from upstream are marked as such. `limits.test.mjs` and `tests/limits.rs` test the safety
 limits. `host.test.mjs` and `src/host/tests.rs` test host mode, the first over sockets against
 the binary and the second in process. `host-oracle.test.mjs`, `settings-oracle.test.mjs`,
-`mutations-oracle.test.mjs`, `import-oracle.test.mjs` and `anki-oracle.test.mjs` compare host mode with the extension itself; they need a Hachidori checkout next to this one
-(or `HACHIDORI_SOURCE`) and run with `node --test`. `anki-oracle.test.mjs` also needs jsdom (and `host-oracle.test.mjs` uses it for the API's Anki fields), found where
+`mutations-oracle.test.mjs`, `profiles-oracle.test.mjs`, `sharing-oracle.test.mjs`, `import-oracle.test.mjs` and `anki-oracle.test.mjs` compare host mode with the extension itself; they need a Hachidori checkout next to this one
+(or `HACHIDORI_SOURCE`) and run with `node --test`, as do `anki-index.test.mjs` and `anki-index-languages.test.mjs`, which follow the
+Anki duplicate index through relay restarts and language profiles with Hachidori's AnkiConnect fake. `anki-oracle.test.mjs` also needs jsdom (and `host-oracle.test.mjs` uses it for the API's Anki fields), found where
 Hachidori's own tests look for it (`HACHIDORI_JSDOM`, Hachidori's `test/tooling`, or
 `~/.cache/hachidori-e2e`), to render the extension's fields. `HACHIDORI_STRESS=1` (Node) or `cargo test --release --test limits -- --ignored` (Rust)
 adds the 128 MiB run. `HACHIDORI_LIVE_TESTS=1` runs `updates-live.test.mjs`, which downloads Bee's

@@ -5,7 +5,7 @@
 //! styles; the output rules follow the Compact HTML Cleanup Anki add-on.
 
 use super::css::{self, Computed, Sheet};
-use super::dom::{Element, Node};
+use super::dom::{Element, Node, deep};
 use crate::host::js;
 
 const SAME: [&str; 13] = ["br", "code", "li", "ol", "rt", "ruby", "sub", "sup", "table", "td", "th", "tr", "ul"];
@@ -28,7 +28,16 @@ fn is_blank(node: &Node) -> bool {
 }
 
 fn holds_block(node: &Node) -> bool {
-    is_block(node) || node.as_element().is_some_and(|element| element.children.iter().any(holds_block))
+    let mut stack = vec![node];
+    while let Some(node) = stack.pop() {
+        if is_block(node) {
+            return true;
+        }
+        if let Some(element) = node.as_element() {
+            stack.extend(&element.children);
+        }
+    }
+    false
 }
 
 /// `parseFloat`.
@@ -141,6 +150,12 @@ fn kept_attributes(ancestors: &[&Element], element: &Element) -> Vec<(String, St
             kept.push(("lang".to_owned(), lang.to_owned()));
         }
     }
+    // A direction is written only where it changes already: the paragraph rule
+    // of docs/languages.md 10.2 marks a block of the other direction, and only
+    // once the records have profiles.
+    if let Some(dir) = element.attribute("dir") {
+        kept.push(("dir".to_owned(), dir.to_owned()));
+    }
     if let Some(content) = element.attribute("data-sc-content") {
         kept.push(("data-sc-content".to_owned(), content.to_owned()));
     }
@@ -149,7 +164,9 @@ fn kept_attributes(ancestors: &[&Element], element: &Element) -> Vec<(String, St
 
 /// `outputTag`.
 fn output_tag(name: &str, display: &str, kept: &[(String, String)]) -> Option<String> {
-    if SAME.contains(&name) {
+    // A list or list item the cascade shows inline (Compact popup and Anki's
+    // glossary lists) is inline like any other element.
+    if SAME.contains(&name) && !(LISTS.contains(&name) && is_inline(display)) {
         return Some(name.to_owned());
     }
     if UNWRAP.contains(&name) {
@@ -168,8 +185,8 @@ fn flatten(mut tag: Option<String>, mut nodes: Vec<Node>, kept: &[(String, Strin
         && only.name == "div"
         && only.attributes.is_empty()
     {
-        let Some(Node::Element(only)) = nodes.pop() else { unreachable!() };
-        nodes = only.children;
+        let Some(Node::Element(mut only)) = nodes.pop() else { unreachable!() };
+        nodes = std::mem::take(&mut only.children);
     }
     if tag.as_deref() == Some("p") && nodes.iter().any(holds_block) {
         tag = Some("div".to_owned());
@@ -205,32 +222,34 @@ impl Compactor<'_> {
         applied: &[&'static str],
         pending: &[&'static str],
     ) -> Vec<Node> {
-        let (Node::Element(element), Node::Element(source)) = (styled, original) else {
-            return match styled {
-                Node::Text(text) => wrap(text_nodes(text), pending),
-                _ => Vec::new(),
+        deep(|| {
+            let (Node::Element(element), Node::Element(source)) = (styled, original) else {
+                return match styled {
+                    Node::Text(text) => wrap(text_nodes(text), pending),
+                    _ => Vec::new(),
+                };
             };
-        };
-        if element.name == "rp" || element.name == "style" {
-            return Vec::new();
-        }
-        let style = self.sheet.computed(ancestors, element, parent, None);
-        if style.display == "none" || style.visibility != "visible" {
-            return Vec::new();
-        }
-        if element.name == "img" {
-            return vec![Node::Element(compact_image(element, source, &style))];
-        }
-        let mut nodes = self.compact_element(element, source, ancestors, &style, parent, applied, pending);
-        if style.display.starts_with("inline") {
-            if parse_float(&style.margin_left) > 0.0 {
-                nodes.insert(0, Node::text(" "));
+            if element.name == "rp" || element.name == "style" {
+                return Vec::new();
             }
-            if parse_float(&style.margin_right) > 0.0 {
-                nodes.push(Node::text(" "));
+            let style = self.sheet.computed(ancestors, element, parent, None);
+            if style.display == "none" || style.visibility != "visible" {
+                return Vec::new();
             }
-        }
-        nodes
+            if element.name == "img" {
+                return vec![Node::Element(compact_image(element, source, &style))];
+            }
+            let mut nodes = self.compact_element(element, source, ancestors, &style, parent, applied, pending);
+            if style.display.starts_with("inline") {
+                if parse_float(&style.margin_left) > 0.0 {
+                    nodes.insert(0, Node::text(" "));
+                }
+                if parse_float(&style.margin_right) > 0.0 {
+                    nodes.push(Node::text(" "));
+                }
+            }
+            nodes
+        })
     }
 
     #[expect(clippy::too_many_arguments, reason = "the extension's compactElement, with the tree walk's state")]
@@ -281,6 +300,13 @@ impl Compactor<'_> {
                 output.set_style("list-style-type", &style.list_style_type);
             }
         }
+        // A list that holds an item of the other direction pads both sides, so
+        // every marker stays inside the field (docs/languages.md 12).
+        if (tag == "ol" || tag == "ul")
+            && nodes.iter().any(|node| node.as_element().is_some_and(|child| child.name == "li" && child.has_attribute("dir")))
+        {
+            output.set_style("padding-inline", "40px");
+        }
         output.children = nodes;
         vec![Node::Element(output)]
     }
@@ -295,31 +321,40 @@ impl Compactor<'_> {
         path: &mut Vec<usize>,
         out: &mut Vec<(Vec<usize>, Element)>,
     ) {
-        ancestors.push(element);
-        for (index, (child, original)) in element.children.iter().zip(&source.children).enumerate() {
-            let (Node::Element(child), Node::Element(original)) = (child, original) else { continue };
-            path.push(index);
-            let computed = self.sheet.computed(ancestors, child, style, None);
-            if child.classes().contains(&"gsm-hoshidicts-glossary-content") {
-                let mut replacement = Element::new("div");
-                ancestors.push(child);
-                for (node, source) in child.children.iter().zip(&original.children) {
-                    replacement.children.extend(self.compact(node, source, ancestors, &computed, &[], &[]));
-                }
-                ancestors.pop();
-                replacement.normalize();
-                replacement.texts_mut(&mut |text| {
-                    while text.contains("  ") {
-                        *text = text.replace("  ", " ");
+        deep(|| {
+            ancestors.push(element);
+            for (index, (child, original)) in element.children.iter().zip(&source.children).enumerate() {
+                let (Node::Element(child), Node::Element(original)) = (child, original) else { continue };
+                path.push(index);
+                let computed = self.sheet.computed(ancestors, child, style, None);
+                if child.classes().contains(&"gsm-hoshidicts-glossary-content") {
+                    let mut replacement = Element::new("div");
+                    // The dictionary's target language, which its text is
+                    // labelled against, and a row's own direction.
+                    for name in ["lang", "dir"] {
+                        if let Some(value) = child.attribute(name) {
+                            replacement.set_attribute(name, value);
+                        }
                     }
-                });
-                out.push((path.clone(), replacement));
-            } else {
-                self.bodies(child, original, ancestors, &computed, path, out);
+                    ancestors.push(child);
+                    for (node, source) in child.children.iter().zip(&original.children) {
+                        replacement.children.extend(self.compact(node, source, ancestors, &computed, &[], &[]));
+                    }
+                    ancestors.pop();
+                    replacement.normalize();
+                    replacement.texts_mut(&mut |text| {
+                        while text.contains("  ") {
+                            *text = text.replace("  ", " ");
+                        }
+                    });
+                    out.push((path.clone(), replacement));
+                } else {
+                    self.bodies(child, original, ancestors, &computed, path, out);
+                }
+                path.pop();
             }
-            path.pop();
-        }
-        ancestors.pop();
+            ancestors.pop();
+        });
     }
 }
 
@@ -348,36 +383,42 @@ fn compact_image(styled: &Element, source: &Element, style: &Computed) -> Elemen
 }
 
 fn strip_sources(element: &mut Element) {
-    if element.name == "img" {
-        element.remove_attribute("src");
-    }
-    for child in &mut element.children {
-        if let Node::Element(child) = child {
-            strip_sources(child);
+    deep(|| {
+        if element.name == "img" {
+            element.remove_attribute("src");
         }
-    }
+        for child in &mut element.children {
+            if let Node::Element(child) = child {
+                strip_sources(child);
+            }
+        }
+    });
 }
 
 fn style_text(element: &Element, out: &mut String) {
-    for child in &element.children {
-        if let Node::Element(child) = child {
-            if child.name == "style" {
-                out.push_str(&child.text_content());
-                out.push('\n');
-            } else {
-                style_text(child, out);
+    deep(|| {
+        for child in &element.children {
+            if let Node::Element(child) = child {
+                if child.name == "style" {
+                    out.push_str(&child.text_content());
+                    out.push('\n');
+                } else {
+                    style_text(child, out);
+                }
             }
         }
-    }
+    });
 }
 
 fn remove_styles(element: &mut Element) {
-    element.children.retain(|child| !matches!(child, Node::Element(child) if child.name == "style"));
-    for child in &mut element.children {
-        if let Node::Element(child) = child {
-            remove_styles(child);
+    deep(|| {
+        element.children.retain(|child| !matches!(child, Node::Element(child) if child.name == "style"));
+        for child in &mut element.children {
+            if let Node::Element(child) = child {
+                remove_styles(child);
+            }
         }
-    }
+    });
 }
 
 fn replace_at(root: &mut Element, path: &[usize], replacement: Element) {
@@ -397,9 +438,9 @@ fn replace_at(root: &mut Element, path: &[usize], replacement: Element) {
 /// Parsed sheets by their text, for the definitions of one note.
 pub(crate) type Sheets = Vec<(String, Sheet)>;
 
-/// `compactAnkiGlossary(document, root)`, with the cascade of `root`'s own styles,
-/// each text parsed once in `sheets`.
-pub(crate) fn compact(mut root: Element, sheets: &mut Sheets) -> String {
+/// `compactAnkiGlossary(document, root, { textAlign })`, with the cascade of
+/// `root`'s own styles, each text parsed once in `sheets`.
+pub(crate) fn compact(mut root: Element, sheets: &mut Sheets, text_align: &str) -> String {
     let mut text = String::new();
     style_text(&root, &mut text);
     let position = sheets.iter().position(|(own, _)| *own == text).unwrap_or_else(|| {
@@ -417,7 +458,7 @@ pub(crate) fn compact(mut root: Element, sheets: &mut Sheets) -> String {
         replace_at(&mut root, &path, replacement);
     }
     remove_styles(&mut root);
-    root.set_css_text("text-align: left;");
+    root.set_css_text(&format!("text-align: {text_align};"));
     root.outer_html()
 }
 
@@ -458,7 +499,7 @@ mod tests {
         );
         root.append(style);
         assert_eq!(
-            compact(root, &mut Vec::new()),
+            compact(root, &mut Vec::new(), "left"),
             "<div class=\"yomitan-glossary\" style=\"text-align: left;\"><ol><li data-dictionary=\"J\"><div>a z <b>[b c]</b>\
              <span data-sc-content=\"note\">n</span></div></li></ol></div>"
         );

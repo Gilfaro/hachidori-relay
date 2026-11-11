@@ -205,6 +205,11 @@ impl Store {
         self.lock().get(key).cloned()
     }
 
+    /// Every stored key with `prefix`.
+    pub(crate) fn keys_with(&self, prefix: &str) -> Vec<String> {
+        self.lock().keys().filter(|key| key.starts_with(prefix)).cloned().collect()
+    }
+
     /// Whether `key` holds `value` (`null` for one never set), compared without a copy.
     pub(crate) fn holds(&self, key: &str, value: &Value) -> bool {
         self.lock().get(key).unwrap_or(&Value::Null) == value
@@ -212,8 +217,14 @@ impl Store {
 
     /// The hello snapshot: the six mirrored keys, `null` for one never set.
     pub(crate) fn snapshot(&self) -> Map<String, Value> {
+        self.with_snapshot(|snapshot| snapshot)
+    }
+
+    /// Runs `read` on the snapshot while the store stays locked, so no commit is
+    /// stored, or told to linked clients, until it returns. `read` must not use the store.
+    pub(crate) fn with_snapshot<T>(&self, read: impl FnOnce(Map<String, Value>) -> T) -> T {
         let storage = self.lock();
-        SNAPSHOT_KEYS.iter().map(|key| ((*key).to_owned(), storage.get(*key).cloned().unwrap_or(Value::Null))).collect()
+        read(SNAPSHOT_KEYS.iter().map(|key| ((*key).to_owned(), storage.get(*key).cloned().unwrap_or(Value::Null))).collect())
     }
 
     /// Writes `changes` (`null` removes a key) and saves them, then runs `after` with the

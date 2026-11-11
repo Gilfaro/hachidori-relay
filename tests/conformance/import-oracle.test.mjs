@@ -76,7 +76,8 @@ test("the relay imports uploaded dictionaries as the extension's own engine does
   const linked = await connectClient(t, relay.port, "/link");
   linked.send(JSON.stringify({ kind: "hello", protocol: 1, version: "0.9.0", name: "Firefox", capabilities: [] }));
   const hello = await untilKind(linked, "hello");
-  assert.deepEqual(hello.capabilities, ["hoshidicts-api-v1", "linked-import-v1", "linked-anki-v2"]);
+  // The list the extension's smoke test pins for its own host (sharing.mjs).
+  assert.deepEqual(hello.capabilities, ["linked-anki-v1", "linked-anki-v2", "hoshidicts-api-v1", "linked-import-v1"]);
   await serveAsBrowserHost(t, relay.port, extension);
   let mirrored = null;
   while (mirrored === null) mirrored = (await untilKind(linked, "storage")).changes.dictionaryState ?? null;

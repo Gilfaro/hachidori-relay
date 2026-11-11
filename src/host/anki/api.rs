@@ -5,6 +5,7 @@
 
 use serde_json::{Map, Value, json};
 
+use super::glossary::Layout;
 use super::{Anki, templates};
 
 pub(crate) use super::templates::escape_html;
@@ -59,14 +60,30 @@ fn card_format(template: &Value) -> Value {
 }
 
 impl Anki {
-    /// `readSmallerAnkiCards`.
-    pub(crate) fn api_compact(&self) -> bool {
-        self.options().get("smallerAnkiCards") == Some(&Value::Bool(true))
+    /// `readSmallerAnkiCards` and `readCompactGlossaries`.
+    pub(crate) fn api_layout(&self) -> Layout {
+        let options = self.options();
+        Layout {
+            compact: options.get("smallerAnkiCards") == Some(&Value::Bool(true)),
+            compact_glossaries: options.get("glossaryLayoutMode") == Some(&json!("compact-popup-anki")),
+        }
     }
 
-    /// `hd_anki_audio` for the enabled sources, or nothing where none plays.
-    pub(crate) fn api_audio(&self, term: &Value) -> Option<(String, String)> {
-        let options = self.options();
+    /// `readProfile`: the `{language, packSettings}` of the profile an API
+    /// request is for, `None` while the records have no profiles.
+    pub(crate) fn api_profile(&self, profile_id: Option<&str>) -> Option<Value> {
+        self.options_and_profile(profile_id).ok()?.1
+    }
+
+    /// The options of the profile an API request is for (`readAnkiOptions`).
+    fn api_options(&self, profile_id: Option<&str>) -> Map<String, Value> {
+        self.options_and_profile(profile_id).map_or_else(|_| self.options(), |(options, _)| options)
+    }
+
+    /// `hd_anki_audio` for the profile's enabled sources, in its language, or
+    /// nothing where none plays.
+    pub(crate) fn api_audio(&self, term: &Value, profile_id: Option<&str>, profile: Option<&Value>) -> Option<(String, String)> {
+        let options = self.api_options(profile_id);
         let sources: Vec<Value> = options
             .get("audioSources")
             .and_then(Value::as_array)
@@ -75,12 +92,23 @@ impl Anki {
         if sources.is_empty() {
             return None;
         }
-        let config = Map::from_iter([("audioSources".to_owned(), Value::Array(sources))]);
+        let mut config = Map::from_iter([("audioSources".to_owned(), Value::Array(sources))]);
+        if let Some(profile) = profile {
+            config.insert("profile".to_owned(), profile.clone());
+        }
         Self::audio(&json!({ "term": term }), &config).ok().map(|file| (file.filename, file.data))
     }
 
-    /// `hd_anki_fields` with each marker as a Template of its own.
-    pub(crate) fn api_render(&self, request: &Value, markers: &[String], audio: &str, compact: bool) -> Result<Rendered, String> {
+    /// `hd_anki_fields` with each marker as a Template of its own, in the
+    /// language of the profile the request is for.
+    pub(crate) fn api_render(
+        &self,
+        request: &Value,
+        markers: &[String],
+        audio: &str,
+        layout: Layout,
+        profile: Option<&Value>,
+    ) -> Result<Rendered, String> {
         let mut templates: Vec<(String, Map<String, Value>)> = Vec::new();
         for marker in markers {
             if !templates.iter().any(|(name, _)| name == marker) {
@@ -88,7 +116,7 @@ impl Anki {
                 templates.push((marker.clone(), template.as_object().cloned().unwrap_or_default()));
             }
         }
-        let (built, media) = self.render_plain(request, &templates, audio, compact).map_err(|error| error.message)?;
+        let (built, media) = self.render_plain(request, &templates, audio, layout, profile).map_err(|error| error.message)?;
         let fields = markers
             .iter()
             .map(|marker| {
@@ -111,9 +139,10 @@ impl Anki {
         valid.then(|| (mime.to_owned(), data.to_owned()))
     }
 
-    /// `hd_api_anki_card_formats`: Hachidori has one set of Templates, Yomitan's profile 0.
-    pub(crate) fn api_card_formats(&self) -> Vec<Value> {
-        let options = self.options();
+    /// `hd_api_anki_card_formats`: the Templates of the profile the request is
+    /// for; Yomitan's profile 0 is Japanese's.
+    pub(crate) fn api_card_formats(&self, profile_id: Option<&str>) -> Vec<Value> {
+        let options = self.api_options(profile_id);
         let templates = options.get("anki").and_then(|anki| anki.get("templates")).and_then(Value::as_array).cloned().unwrap_or_default();
         templates.iter().map(card_format).collect()
     }

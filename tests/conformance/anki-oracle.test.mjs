@@ -22,6 +22,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { startAnkiConnect } from "./anki-fake.mjs";
 import { relayBinary, startAnkiRelayServer } from "./anki-relay-server.mjs";
 import { connectClient, untilKind } from "./relay-socket.mjs";
+import { oracleSkip } from "./oracle-skip.mjs";
 
 const REPO = fileURLToPath(new URL("../..", import.meta.url));
 const HACHIDORI = resolve(process.env.HACHIDORI_SOURCE ?? join(REPO, "..", "hachidori"));
@@ -39,7 +40,7 @@ const missing = [
   ...(jsdomEntry ? [] : ["jsdom"]),
   ...["test/extension-smoke/fakes.mjs", "test/anki-connect-fake.mjs"].map((path) => join(HACHIDORI, path)).filter((path) => !existsSync(path)),
 ];
-const skip = missing.length > 0 && `needs ${missing.join(", ")}`;
+const skip = oracleSkip(missing);
 const INDEX_KEY = "ankiDuplicateIndex";
 
 // The smoke fakes strip a module's imports with LF-only patterns, so a checkout with
@@ -66,7 +67,12 @@ const ankiOptions = (url, fields = {}) => ({
   ...fields,
 });
 
-// The extension's engine as preflight reads it: the relay's generation, no styles.
+// Chromium serialises a scoped rule's `[data-dictionary=ident]` as a quoted
+// string, as the relay writes it; jsdom keeps the text the extension set.
+const browserCss = (value) => JSON.parse(JSON.stringify(value)
+  .replace(/\[data-dictionary=([A-Za-z_][\w-]*)\]/gu, (_, name) => `[data-dictionary=\\"${name}\\"]`));
+
+// The extension's engine as preflight reads it: the relay's generation, styles and media.
 async function bootExtension(seed, ankiUrl, engineState) {
   readSourcesAsLf();
   const fakes = await import(pathToFileURL(join(HACHIDORI, "test/extension-smoke/fakes.mjs")));
@@ -101,7 +107,11 @@ async function bootExtension(seed, ankiUrl, engineState) {
     if (message.type === "hd_status") {
       return answer(message, sendResponse, () => ({ ready: true, loading: false, generation: engineState.generation }));
     }
-    if (message.type === "hd_styles") return answer(message, sendResponse, () => ({ generation: engineState.generation, styles: [] }));
+    if (message.type === "hd_styles") return answer(message, sendResponse, () => engineState.styles());
+    // Dictionary images: the relay's engine holds the same dictionaries.
+    if (message.type === "hd_media") return answer(message, sendResponse, () => engineState.ask(message));
+    // The sentence's words for {sentence-furigana}, split by the same engine.
+    if (message.type === "hd_segment") return answer(message, sendResponse, () => engineState.ask(message));
     return answer(message, sendResponse, () => { throw new Error(`no engine request ${message.type} in this oracle`); });
   });
   // The offscreen document's pronunciation export. Node cannot decode audio, so the
@@ -131,10 +141,11 @@ async function bootExtension(seed, ankiUrl, engineState) {
     if (message?.target !== "hachidori-anki-render" || message.type !== "hd_anki_fields") return false;
     return answer(message, sendResponse, () => buildAnkiResourceFields(message.request, message.templates, {
       document: dom.window.document, dictionaryPaths: message.dictionaryPaths, audio: message.audio,
-      compactGlossary: message.compactGlossary === true,
+      compactGlossary: message.compactGlossary === true, compactGlossaries: message.compactGlossaries === true,
       styles: async () => {
-        if (engineState.generation !== message.request.generation) throw new Error("Dictionary styles changed during Anki preparation.");
-        return [];
+        const reply = await engineState.styles();
+        if (reply.generation !== message.request.generation) throw new Error("Dictionary styles changed during Anki preparation.");
+        return reply.styles;
       },
     }));
   });
@@ -148,12 +159,18 @@ async function bootExtension(seed, ankiUrl, engineState) {
     );
     return true;
   });
+  // The background bundle leaves profile-state.js out; the extension's own
+  // profile tests hand its functions in (profiles.test.mjs).
+  const profileState = await import(pathToFileURL(join(HACHIDORI, "extension/profile-state.js")));
+  const { profileTemplateKey } = await import(pathToFileURL(join(HACHIDORI, "extension/anki-worker.js")));
   const context = fakes.loadBackgroundScript({
     chrome: fakes.makeChrome("sw", bus, storage, fakes.makeAlarms()), console, fetch, setTimeout, clearTimeout, URL,
     // This realm's errors, so the worker's `instanceof Error` sees the modules' throws.
     Error, TypeError, Promise, AbortController,
+    ...Object.fromEntries(Object.entries(profileState).filter(([, value]) => typeof value === "function")),
+    profileTemplateKey,
   });
-  return { context, close: () => dom.window.close(), index: async () => (await storage.api().local.get(INDEX_KEY))[INDEX_KEY] ?? null };
+  return { context, storage, close: () => dom.window.close(), index: async () => (await storage.api().local.get(INDEX_KEY))[INDEX_KEY] ?? null };
 }
 
 // A host start's random linked-key prefix and the configuration digest (whose JSON
@@ -214,6 +231,14 @@ const mined = (expression, reading, generation, fields = {}) => ({
   },
   ...fields,
 });
+// A glossary nested past serde_json's default limit (128) but within what jsdom's
+// recursive serialiser can stand in for a browser's: the extension has a node
+// limit and no depth limit (deeper cases: glossary.rs tests).
+const nested = (depth) => {
+  let content = ["before <&>", { tag: "p", content: "paragraph" }, { tag: "a", href: "https://example.com/", content: "link" }, " after"];
+  for (let level = 0; level < depth; level += 1) content = { tag: level % 2 ? "span" : "div", style: { marginLeft: "1px" }, content };
+  return { glossaries: [{ dictionary: "B", definitionTags: "", termTags: "", glossary: structured(content) }] };
+};
 const preflight = (expression, reading, fields = {}) => (side) => anki("hd_anki_preflight",
   { configKey: side.key, ...mined(expression, reading, side.generation, fields) });
 // A submission and the media the linked browser sends with it (none: no envelope).
@@ -221,6 +246,11 @@ const submit = (expression, reading, fields = {}, clientMedia = {}) => (side) =>
   ...anki("hd_anki_submit", { configKey: side.key, ...mined(expression, reading, side.generation, typeof fields === "function" ? fields(side) : fields) }),
   ...(clientMedia === null ? {} : { clientMedia }),
 });
+const deepPreflight = (side) => {
+  const message = preflight("鱈", "たら")(side);
+  message.request.term = { ...message.request.term, ...nested(600) };
+  return message;
+};
 const SHOT = { token: "shot-1", filename: "hachidori-screenshot-0f8fad5b-d9cb-469f-a165-70867728950e.jpg" };
 const JPEG = "/9j/4AAQSkZJRg==";
 const source = (id, type, url) => ({ id, type, enabled: true, url, voice: "" });
@@ -231,7 +261,7 @@ const markers = {
   Expression: template("{expression}"), ExpressionFurigana: template("{furigana}"), ExpressionReading: template("{reading}"),
   MainDefinition: template("{glossary-first}"), SelectionText: template("{glossary-plain-no-dictionary}"),
   Sentence: template("{cloze-prefix}<b>{cloze-body}</b>{cloze-suffix}"), Glossary: template("{glossary}"),
-  Hint: template("{glossary-brief}"), MiscInfo: template("{tags} {part-of-speech} {dictionary} {dictionary-alias}"),
+  Hint: template("{glossary-brief}"), MiscInfo: template("{tags} {part-of-speech} {dictionary} {dictionary-alias} {miscInfo}"),
   PitchPosition: template("{pitch-position}"), PitchCategories: template("{pitch-accent-categories}"),
   DefinitionPicture: template("{pitch-accent-graphs}"), Frequency: template("{frequencies}"),
   FreqSort: template("{frequency-harmonic-rank}|{frequency-average-occurrence}"), Picture: template("{screenshot}"),
@@ -283,6 +313,208 @@ function writes(fake) {
     configure([audio], { duplicateBehavior: "new" }),
     { message: submit("猫", "ねこ"), mutates: true },
     { message: submit("猫", "ねこ", { allowDuplicate: true }), mutates: true },
+    // Model scope: Anki's add is the duplicate check, and media goes with the note
+    // (#683): a bare screenshot and pronunciation as attachments, one in rich
+    // HTML stored first.
+    configure([audio], { duplicateScope: "model" }),
+    { message: preflight("鱸", "すずき") },
+    { message: submit("鱸", "すずき", { screenshot: SHOT }, { screenshot: { ...SHOT, data: JPEG } }), mutates: true },
+    { message: submit("鱸", "すずき"), mutates: true },
+    { message: preflight("鱸", "すずき") },
+    configure([audio], { duplicateScope: "model", fieldTemplates: templates({ Picture: template("<div>{screenshot}</div>") }) }),
+    { message: submit("鰈", "かれい", { screenshot: SHOT }, { screenshot: { ...SHOT, data: JPEG } }), mutates: true },
+    { message: submit("鮭", "さけ", { screenshot: SHOT }), mutates: true },
+    configure([missing], { duplicateScope: "model" }),
+    { message: submit("鯖", "さば"), mutates: true },
+    // Faults (anki-fake.mjs): what Anki did is known only from what it holds.
+    configure([audio]),
+    ...faultSteps(fake),
+    ...imageSteps(fake),
+    ...templateSteps(fake),
+    ...presetSteps(fake),
+  ];
+}
+
+// The Senren and Lapis presets as upstream's applyAnkiPreset fills them, a
+// setup proposal for Senren, the page's selection, title, address and search
+// in the fields that name them, the sentence with furigana, and a kanji entry
+// mined as a note.
+let PRESETS;
+const SENREN_FIELDS = ["word", "reading", "sentence", "sentenceFurigana", "sentenceTranslation", "sentenceCard", "audioCard", "notes",
+  "hint", "picture", "wordAudio", "sentenceAudio", "selectionText", "definition", "glossary", "pitchAccents", "pitchPositions",
+  "pitchCategories", "frequencies", "freqSort", "miscInfo", "dictionaryPreference"];
+const PAGE = { popupSelectionText: "海に<鯱>\nがいる", documentTitle: "Fish & <whales>", pageUrl: "https://example.com/?a=1&b=<2>",
+  searchQuery: "鯱 \"q\"" };
+const KANJI_ENTRY = { dictionary: "KANJIDIC", onyomi: "コ", kunyomi: "しゃち しゃちほこ", tags: "jinmeiyou",
+  definitions: ["killer whale", "grampus"], stats: [{ name: "strokes", value: "19" }, { name: "grade", value: "9" }] };
+function presetSteps(fake) {
+  const optionsWrite = (patch) => (side) => worker("hd_options_write", { baseRevision: side.revision, options: patch(side) });
+  const sorted = (record) => Object.fromEntries(Object.entries(record).sort(([left], [right]) => (left < right ? -1 : 1)));
+  const preset = (model, family, deck) => ({ message: optionsWrite(() => ({ anki: ankiOptions(fake.url, { model, deck,
+    fieldTemplates: sorted(PRESETS.applyAnkiPreset({}, fake.state.models[model].fields, family).fieldTemplates) }) })),
+  revision: true, key: true });
+  const page = (expression, reading) => submit(expression, reading, PAGE);
+  const kanji = (character, fields = {}) => (side) => {
+    const message = submit(character, "", fields)(side);
+    message.request = { ...message.request, matched: character, sentence: `${character}の字`, matchOffset: 0, trace: [],
+      term: { expression: character, reading: "", rules: "", score: 0, frequencies: [], pitches: [],
+        glossaries: [{ dictionary: KANJI_ENTRY.dictionary, definitionTags: "", termTags: "", kanji: KANJI_ENTRY,
+          glossary: structured([{ tag: "ol", content: KANJI_ENTRY.definitions.map((content) => ({ tag: "li", content })) }]) }] } };
+    return message;
+  };
+  return [
+    // Senren holds the most notes: unconfigured, setup proposes it with its preset.
+    { before: () => {
+      fake.state.models.Senren = { id: 1004, fields: SENREN_FIELDS };
+      const counts = Object.keys(fake.state.models).map((model) => fake.state.notes.filter((note) => note.modelName === model).length);
+      for (let index = 0; index <= Math.max(...counts); index += 1) {
+        fake.state.notes.push({ noteId: 5000 + index, modelName: "Senren", deckName: "Mining::Sub", mature: false,
+          fields: Object.fromEntries(SENREN_FIELDS.map((field, position) => [field, position === 0 ? `語${index}` : ""])) });
+      }
+    }, message: optionsWrite(() => ({ anki: ankiOptions(fake.url, { model: "", fieldTemplates: null }) })), revision: true, key: true },
+    { message: worker("hd_anki_setup") },
+    preset("Senren", "senren", "Mining::Sub"),
+    { message: preflight("鯱", "しゃち", PAGE) },
+    { message: page("鯱", "しゃち"), mutates: true },
+    { message: page("鯱", "しゃち"), mutates: true },
+    { message: submit("鰯", "いわし"), mutates: true },
+    preset("Lapis v1", "lapis", "Mining"),
+    { message: page("鰹節", "かつおぶし"), mutates: true },
+    // A kanji entry: the character, its readings, stroke count and tags.
+    { message: optionsWrite(() => ({ anki: ankiOptions(fake.url, { fieldTemplates: sorted({
+      Expression: template("{character}"), ExpressionReading: template("{onyomi}"), MainDefinition: template("{kunyomi}"),
+      Hint: template("{stroke-count}"), Glossary: template("{glossary}"), MiscInfo: template("{tags}|{part-of-speech}|{conjugation}"),
+      Sentence: template("{sentence}"), ExpressionFurigana: template("{furigana}") }) }) })), revision: true, key: true },
+    { message: kanji("鰐"), mutates: true },
+    { message: kanji("鰐"), mutates: true },
+  ];
+}
+
+// Two Templates: a second one, on another note type, deck and duplicate
+// scope, chosen by `templateId` in every request that takes one, with its own
+// configuration key; the first one's key does not reach it.
+function templateSteps(fake) {
+  const optionsWrite = (patch) => (side) => worker("hd_options_write", { baseRevision: side.revision, options: patch(side) });
+  // A written Template must be its normalised form: field templates in order.
+  const sorted = (record) => Object.fromEntries(Object.entries(record).sort(([left], [right]) => (left < right ? -1 : 1)));
+  const first = ankiOptions(fake.url, { fieldTemplates: sorted(markers) });
+  const { url, apiKey, ...firstTemplate } = first;
+  const basic = {
+    id: "basic", name: "Basic cards", deck: "Default", model: "Basic", tags: ["basic"], duplicateScope: "deck",
+    duplicateBehavior: "prevent", captureScreenshot: false, fields: firstTemplate.fields,
+    fieldTemplates: { Back: template("{glossary-first}"), Front: template("{expression}") },
+  };
+  const templates = [{ id: "default", name: "Default", ...firstTemplate }, basic];
+  const forTemplate = (id, build) => (side) => {
+    const message = build({ ...side, key: side.keys?.[id] ?? "" });
+    message.request = { ...message.request, templateId: id };
+    return message;
+  };
+  return [
+    // A Templates write carries the first one's fields too, as the extension's projection does.
+    { message: optionsWrite(() => ({ anki: { url, apiKey, templates, ...firstTemplate } })), revision: true, key: true,
+      templateKeys: ["basic", "default"] },
+    { message: anki("hd_anki_status") },
+    { message: anki("hd_anki_status", undefined, { templateId: "basic" }) },
+    { message: anki("hd_anki_status", undefined, { templateId: "default" }) },
+    { message: anki("hd_anki_view", { ...term("猫"), templateId: "basic" }) },
+    { message: anki("hd_anki_screenshot", undefined, { templateId: "basic" }) },
+    { message: worker("hd_anki_discover", { model: "Basic" }) },
+    { message: worker("hd_anki_setup", { templateId: "basic" }) },
+    { message: forTemplate("basic", preflight("猫", "ねこ")) },
+    { message: forTemplate("basic", preflight("蛸", "たこ")) },
+    { message: forTemplate("basic", submit("蛸", "たこ")), mutates: true },
+    { message: forTemplate("basic", submit("蛸", "たこ")), mutates: true },
+    { message: forTemplate("default", preflight("蛸", "たこ")) },
+    { message: forTemplate("default", submit("蛸", "たこ")), mutates: true },
+    // A Template's request with the other one's key, or a key without a Template.
+    { message: (side) => {
+      const message = preflight("蛸", "たこ")({ ...side, key: side.keys.default });
+      message.request.templateId = "basic";
+      return message;
+    } },
+    { message: forTemplate("nope", preflight("蛸", "たこ")) },
+    { message: (side) => anki("hd_anki_browse", { configKey: side.keys.basic, expression: "蛸", templateId: "basic" }) },
+    { message: (side) => anki("hd_anki_browse", { configKey: side.keys.basic, expression: "蛸" }) },
+  ];
+}
+
+// Dictionary images (the fixture's media/kanji.png): refused by Anki, then
+// stored with a later note and found already stored, missing from the
+// dictionary, and with model scope (#683).
+function imageSteps(fake) {
+  const image = (path) => ({ glossaries: [
+    { dictionary: "hachidori-fixture", definitionTags: "", termTags: "", glossary: structured([
+      { tag: "img", path, width: 16, height: 16, title: "kanji glyph", alt: "kanji", collapsible: false }, "a glyph"]) },
+    { dictionary: "A", definitionTags: "", termTags: "", glossary: JSON.stringify(["plain"]) }] });
+  const pictured = (expression, reading, path = "media/kanji.png") => (side) => {
+    const message = submit(expression, reading)(side);
+    message.request.term = { ...message.request.term, ...image(path) };
+    return message;
+  };
+  const checked = (expression, reading) => (side) => {
+    const message = preflight(expression, reading)(side);
+    message.request.term = { ...message.request.term, ...image("media/kanji.png") };
+    return message;
+  };
+  const isImage = (params) => params?.filename?.endsWith(".png");
+  const audio = source("audio", "custom", `${fake.url}/audio/{term}.mp3`);
+  const optionsWrite = (patch) => (side) => worker("hd_options_write", { baseRevision: side.revision, options: patch(side) });
+  const configure = (fields) => ({ message: optionsWrite(() => ({ audioSources: [audio], anki: ankiOptions(fake.url, {
+    fieldTemplates: { ...markers, ExpressionAudio: template("{audio}") }, ...fields }) })), revision: true, key: true });
+  return [
+    configure({}),
+    { message: checked("字", "じ") },
+    { faults: () => [{ action: "storeMediaFile", kind: "error", message: "media folder is read-only", filter: isImage }],
+      message: pictured("漢", "かん"), mutates: true },
+    { message: pictured("字", "じ"), mutates: true },
+    { message: pictured("文字", "もじ"), mutates: true },
+    { message: pictured("漢方", "かんぽう"), mutates: true },
+    { message: pictured("綴", "つづり", "media/none.png"), mutates: true },
+    configure({ duplicateScope: "model" }),
+    { message: checked("書", "しょ") },
+    { message: pictured("書", "しょ"), mutates: true },
+    { message: pictured("画", "が"), mutates: true },
+  ];
+}
+
+// AnkiConnect failing part-way: lost acknowledgements, undispatched writes,
+// refusals, a failed readback, add-on rewrites, lost media, and the collection
+// changing under an overwrite.
+function faultSteps(fake) {
+  // Its own file: a failed write removes the screenshot it stored.
+  const own = { token: "shot-2", filename: "hachidori-screenshot-1b4e28ba-2fa1-41d2-883f-0016d3cca427.jpg" };
+  const shot = (expression, reading) => submit(expression, reading, { screenshot: own }, { screenshot: { ...own, data: JPEG } });
+  const lastNote = (state) => state.notes.at(-1);
+  const noteOf = (state, params) => state.notes.find((note) => note.noteId === params.note.id);
+  const audio = source("audio", "custom", `${fake.url}/audio/{term}.mp3`);
+  const optionsWrite = (patch) => (side) => worker("hd_options_write", { baseRevision: side.revision, options: patch(side) });
+  return [
+    { faults: () => [{ action: "addNote", kind: "drop-after" }], message: submit("鰆", "さわら"), mutates: true },
+    { faults: () => [{ action: "addNote", kind: "drop-before" }], message: submit("鰤", "ぶり"), mutates: true },
+    { faults: () => [{ action: "addNote", kind: "error", message: "collection is not available" }], message: submit("鯛", "たい"), mutates: true },
+    { faults: () => [{ action: "notesInfo", after: "addNote", kind: "error", message: "readback failed" }], message: submit("鮎", "あゆ"), mutates: true },
+    { faults: () => [{ action: "addNote", kind: "edit", when: "after", edit: (state) => {
+      const note = lastNote(state);
+      note.fields.Glossary = note.fields.Glossary.replace(/<[^>]+>/gu, "");
+    } }], message: submit("鰊", "にしん"), mutates: true },
+    { faults: () => [{ action: "storeMediaFile", kind: "lost-store" }], message: shot("鰰", "はたはた"), mutates: true },
+    { faults: () => [{ action: "storeMediaFile", kind: "drop-after" }], message: shot("鱧", "はも"), mutates: true },
+    { faults: () => [{ action: "storeMediaFile", kind: "error", message: "media folder is read-only" }], message: shot("鮃", "ひらめ"), mutates: true },
+    { message: optionsWrite(() => ({ audioSources: [audio], anki: ankiOptions(fake.url, { duplicateBehavior: "overwrite",
+      fieldTemplates: { ...markers, ExpressionAudio: template("{audio}") } }) })), revision: true, key: true },
+    { faults: () => [{ action: "updateNoteFields", kind: "edit", edit: (state, params) => {
+      noteOf(state, params).fields.Sentence = "edited in Anki";
+    } }], message: submit("犬", "いぬ"), mutates: true },
+    { faults: () => [{ action: "updateNoteFields", kind: "edit", edit: (state, params) => {
+      state.notes = state.notes.filter((note) => note.noteId !== params.note.id);
+    } }], message: submit("鳥", "とり"), mutates: true },
+    { faults: () => [{ action: "updateNoteFields", kind: "drop-after" }], message: submit("鯨", "くじら"), mutates: true },
+    { faults: () => [{ action: "updateNoteFields", kind: "drop-before" }], message: submit("鯉", "こい"), mutates: true },
+    // #698: an open Anki editor refuses the update before writing; once it is closed the update goes through.
+    { faults: () => [{ action: "updateNoteFields", kind: "error",
+      message: "Close the affected editor before this API write, even if its content is saved." }], message: submit("犬", "いぬ"), mutates: true },
+    { message: submit("犬", "いぬ"), mutates: true },
   ];
 }
 
@@ -297,6 +529,11 @@ function steps(fake) {
     { message: anki("hd_anki_status", undefined, { templateId: "default" }) },
     { message: anki("hd_anki_status", undefined, { templateId: "nope" }) },
     { message: anki("hd_anki_status", undefined, { templateId: "" }) },
+    // A request naming a profile: on records without profiles only Japanese is one.
+    { message: anki("hd_anki_status", undefined, { profileId: "ja" }) },
+    { message: anki("hd_anki_status", undefined, { profileId: "en" }) },
+    { message: anki("hd_anki_status", undefined, { profileId: "" }) },
+    { message: anki("hd_anki_view", term("猫"), { profileId: "en" }) },
     { message: anki("hd_anki_view", term("猫")) },
     { message: anki("hd_anki_view", term("犬")) },
     { message: anki("hd_anki_view", term("abc")) },
@@ -339,9 +576,23 @@ function steps(fake) {
     { message: preflight("鯨", "くじら") },
     { message: preflight("猫", "ねこ") },
     { message: preflight("あ", "") },
+    { message: deepPreflight },
     { message: optionsWrite(() => ({ smallerAnkiCards: true })), revision: true, key: true },
     { message: preflight("鯨", "くじら") },
+    { message: deepPreflight },
     { message: optionsWrite(() => ({ smallerAnkiCards: false })), revision: true, key: true },
+    // Compact popup and Anki (#673), alone and with Smaller Anki cards.
+    { message: optionsWrite(() => ({ glossaryLayoutMode: "compact-popup-anki" })), revision: true, key: true },
+    { message: preflight("鯨", "くじら") },
+    { message: optionsWrite(() => ({ smallerAnkiCards: true })), revision: true, key: true },
+    { message: preflight("鯨", "くじら") },
+    { message: optionsWrite(() => ({ smallerAnkiCards: false, glossaryLayoutMode: "default" })), revision: true, key: true },
+    // Model scope over every marker: preflight renders only what Anki's check needs.
+    { message: optionsWrite(() => ({ anki: ankiOptions(fake.url, { duplicateScope: "model", fieldTemplates: markers }) })),
+      revision: true, key: true, wordStatus: true },
+    { message: preflight("鯨", "くじら") },
+    { message: preflight("猫", "ねこ") },
+    { message: anki("hd_anki_status") },
     // The first field renders nothing.
     { message: optionsWrite(() => ({ anki: ankiOptions(fake.url, { fieldTemplates: { ...markers, Expression: template("{onyomi}") } }) })),
       revision: true, key: true },
@@ -378,6 +629,9 @@ function steps(fake) {
     { message: preflight("鯨", "くじら") },
     { message: optionsWrite(() => ({ anki: ankiOptions(fake.url, { duplicateBehavior: "new" }) })), revision: true, key: true },
     { message: preflight("猫", "ねこ") },
+    // No deck chosen yet: a status that names no profile carries no emptyDeck hint.
+    { message: optionsWrite(() => ({ anki: ankiOptions(fake.url, { deck: "" }) })), revision: true, key: true },
+    { message: anki("hd_anki_status") },
     // Unconfigured: setup proposes the busiest recognised note type and its busiest deck.
     { message: optionsWrite(() => ({ anki: ankiOptions(fake.url, { model: "", fieldTemplates: null }) })), revision: true, key: true },
     { message: anki("hd_anki_status") },
@@ -399,6 +653,7 @@ function steps(fake) {
 
 test("the relay answers Anki requests as the extension's service worker does", { skip, timeout: 180_000 }, async (t) => {
   const { answerAnkiConnect, AnkiConnectError } = await import(pathToFileURL(join(HACHIDORI, "test/anki-connect-fake.mjs")));
+  PRESETS = await import(pathToFileURL(join(HACHIDORI, "extension/anki-templates.js")));
   const fake = await startAnkiConnect(answerAnkiConnect, AnkiConnectError);
   t.after(() => fake.close());
   const seed = { options: { revision: 1, anki: ankiOptions(fake.url) } };
@@ -413,6 +668,50 @@ test("the relay answers Anki requests as the extension's service worker does", {
   const socket = await connectClient(t, relay.port, "/link");
   socket.send(JSON.stringify({ kind: "hello", protocol: 1, version: "0.9.0", name: "linked", capabilities: ["linked-anki-v2"] }));
   await untilKind(socket, "hello");
+  // The fixture dictionary, with its image, installed in the relay; the extension
+  // lists the same dictionaries (an image's filename is named by its path) and
+  // reads their media from the relay's engine.
+  const media = await connectClient(t, relay.port, "/link");
+  media.send(JSON.stringify({ kind: "hello", protocol: 1, version: "0.9.0", name: "media", capabilities: ["linked-anki-v2", "linked-import-v1"] }));
+  await untilKind(media, "hello");
+  const ask = async (message) => {
+    media.send(JSON.stringify({ kind: "request", id: "media", message }));
+    return (await untilKind(media, "reply")).response;
+  };
+  // `uploadDictionary`: the archive in the chunks the relay asks for.
+  const archive = readFileSync(join(HACHIDORI, "test/fixtures/hachidori-fixture.zip"));
+  const target = "hachidori-linked-import";
+  const begun = await ask({ target, type: "hd_import_begin", requestId: "begin", fileName: "hachidori-fixture.zip", size: archive.length, replace: false });
+  assert.equal(typeof begun.token, "string", JSON.stringify(begun));
+  for (let offset = 0; offset < archive.length; offset += begun.chunkBytes) {
+    const chunk = await ask({ target, type: "hd_import_chunk", requestId: "chunk", token: begun.token, offset,
+      data: archive.subarray(offset, offset + begun.chunkBytes).toString("base64") });
+    assert.notEqual(chunk.ok, false, JSON.stringify(chunk));
+  }
+  const imported = await ask({ target, type: "hd_import_commit", requestId: "commit", token: begun.token });
+  assert.equal(imported.ok, true, JSON.stringify(imported));
+  socket.send(JSON.stringify({ kind: "request", id: "state", message: worker("hd_state_read") }));
+  const { state } = (await untilKind(socket, "reply")).response;
+  assert.equal(state.dictionaries.length, 1);
+  // Committing the dictionary normalised the stored options, as the
+  // extension's state commit does (legacy Anki fields become Templates): both
+  // sides start from the relay's records.
+  const importedOptions = JSON.parse(readFileSync(join(dir, "storage.json"), "utf8")).options;
+  await extension.storage.api().local.set({ dictionaryState: state, options: importedOptions });
+  let mediaAsked = Promise.resolve();
+  engineState.ask = (message) => {
+    const asked = mediaAsked.then(async () => {
+      const response = await ask(message);
+      if (!response.ok) throw new Error(response.error);
+      return response;
+    });
+    mediaAsked = asked.catch(() => {});
+    return asked;
+  };
+  engineState.styles = async () => {
+    const response = await engineState.ask({ target: "hoshidicts-offscreen", type: "hd_styles", requestId: "styles" });
+    return { generation: response.generation, styles: response.styles };
+  };
   // The relay's dictionary generation, which the extension's fake engine reports too.
   socket.send(JSON.stringify({ kind: "request", id: 0, message: { target: "hoshidicts-offscreen", type: "hd_status", requestId: "generation" } }));
   const statusFrame = await untilKind(socket, "reply");
@@ -431,8 +730,8 @@ test("the relay answers Anki requests as the extension's service worker does", {
   };
 
   const sides = {
-    extension: { name: "extension", key: "", revision: 1, generation: engineState.generation, index: extension.index },
-    relay: { name: "relay", key: "", revision: 1, generation: engineState.generation, index: relayIndex },
+    extension: { name: "extension", key: "", revision: importedOptions.revision, generation: engineState.generation, index: extension.index },
+    relay: { name: "relay", key: "", revision: importedOptions.revision, generation: engineState.generation, index: relayIndex },
   };
   // Both pull the seeded Template's index at start.
   const initial = await settled(extension.index);
@@ -461,6 +760,9 @@ test("the relay answers Anki requests as the extension's service worker does", {
         written = collection();
         Object.assign(fake.state, structuredClone(start));
       }
+      // Each side meets the same faults.
+      fake.state.faults = step.faults ? step.faults() : [];
+      fake.state.ran = [];
       if (name === "extension") {
         replies[name] = await extension.context.dispatchSharedRequest(structuredClone(message), "linked", ["linked-anki-v2"]);
       } else {
@@ -477,36 +779,40 @@ test("the relay answers Anki requests as the extension's service worker does", {
           for (const revision of announced) assert.ok(revision === null || revision <= stored.rowRevision);
         }
       }
+      assert.deepEqual(fake.state.faults, [], `every fault fired for ${name}`);
       if (step.key) side.key = "";
       if (step.revision && replies[name].ok) side.revision = replies[name].options.revision;
       queries[name] = browsed(from);
       notes[name] = checked(from);
       side.stored = await settled(side.index);
       if (step.key && !side.key) {
-        // A Template change makes a new configuration key; read it as a linked page would.
-        const status = name === "extension"
-          ? await extension.context.dispatchSharedRequest(anki("hd_anki_status"), "linked", ["linked-anki-v2"])
-          : await (async () => {
+        // A Template change makes a new configuration key; read it as a linked page
+        // would, for the first Template and each other one the step names.
+        const status = (extra) => (name === "extension"
+          ? extension.context.dispatchSharedRequest(anki("hd_anki_status", undefined, extra), "linked", ["linked-anki-v2"])
+          : (async () => {
             counter += 1;
-            socket.send(JSON.stringify({ kind: "request", id: counter, message: anki("hd_anki_status") }));
+            socket.send(JSON.stringify({ kind: "request", id: counter, message: anki("hd_anki_status", undefined, extra) }));
             return (await untilReply()).frame.response;
-          })();
-        side.key = status.configKey ?? "";
+          })());
+        side.key = (await status()).configKey ?? "";
+        side.keys = {};
+        for (const id of step.templateKeys ?? []) side.keys[id] = (await status({ templateId: id })).configKey ?? "";
       }
     }
     const label = JSON.stringify(typeof step.message === "function" ? step.message(sides.relay) : step.message).slice(0, 160);
     assert.deepEqual(comparable(replies.relay), comparable(replies.extension), label);
     seen.push(replies.extension);
     assert.deepEqual(queries.relay, queries.extension, `Anki browser queries for ${label}`);
-    assert.deepEqual(notes.relay, notes.extension, `the notes checked for ${label}`);
-    if (written) assert.deepEqual(collection(), written, `the collection after ${label}`);
+    assert.deepEqual(notes.relay, browserCss(notes.extension), `the notes checked for ${label}`);
+    if (written) assert.deepEqual(collection(), browserCss(written), `the collection after ${label}`);
     checks.push(...notes.extension);
     assert.deepEqual(comparable(sides.relay.stored), comparable(sides.extension.stored), `the stored index after ${label}`);
   }
   // The sequence reaches what matters: cached duplicates, repairs, Anki's browser,
   // word status, a setup proposal and refusals, and the relay announced index changes.
   if (process.env.ANKI_ORACLE_DUMP) console.log(JSON.stringify(seen, null, 1));
-  assert.ok(seen.filter((reply) => reply.type === "hd_options_write_result").every((reply) => reply.ok), "every options write commits");
+  assert.ok(seen.filter((reply) => reply.type === "hd_options_write_result").every((reply) => reply.ok), JSON.stringify(seen.filter((reply) => reply.type === "hd_options_write_result" && !reply.ok)));
   const of = (type) => seen.filter((reply) => reply.type === `${type}_result`);
   assert.ok(of("hd_anki_view").some((reply) => reply.state === "duplicate" && reply.mature === true && reply.noteIds.length > 1));
   assert.ok(of("hd_anki_browse").some((reply) => reply.opened === true && reply.repaired === true));
@@ -530,6 +836,31 @@ test("the relay answers Anki requests as the extension's service worker does", {
   assert.ok(submitted.some((reply) => reply.ok === false && reply.error.includes("client-media")));
   assert.ok(submitted.some((reply) => reply.warnings?.some((warning) => warning.startsWith("Pronunciation: "))));
   assert.ok(submitted.some((reply) => reply.state === "added" && reply.warnings?.length === 0));
+  // The fault paths: unconfirmed writes, a failed readback, an add-on rewrite and lost media.
+  assert.ok(submitted.filter((reply) => reply.state === "uncertain").length >= 5);
+  assert.ok(submitted.some((reply) => reply.warnings?.some((warning) => warning.includes("readback failed"))));
+  assert.ok(submitted.some((reply) => reply.warnings?.some((warning) => warning.includes("saved with different content"))));
+  assert.ok(submitted.some((reply) => reply.warnings?.some((warning) => warning.startsWith("Screenshot: AnkiConnect: media folder"))));
+  // The second Template mines into its own note type, deck and tags.
+  assert.ok(fake.state.notes.some((note) => note.modelName === "Basic" && note.deckName === "Default"
+    && note.tags?.includes("basic") && note.fields.Front === "蛸"));
+  // The presets: a Senren proposal, and notes with the page's details, the
+  // sentence with furigana and a kanji entry's readings.
+  assert.ok(of("hd_anki_setup").some((reply) => reply.proposal?.status === "configured" && reply.proposal.model === "Senren"
+    && reply.proposal.deck === "Mining::Sub" && reply.proposal.fieldTemplates?.selectionText?.value === "{popup-selection-text}"));
+  const senren = fake.state.notes.find((note) => note.modelName === "Senren" && note.fields.word === "鯱");
+  assert.ok(senren, "a Senren note");
+  assert.equal(senren.fields.selectionText, "海に&lt;鯱&gt;<br>\nがいる");
+  assert.equal(senren.fields.miscInfo, "Fish &amp; &lt;whales&gt;");
+  assert.ok(/<b>.*しゃち.*<\/b>/u.test(senren.fields.sentenceFurigana), senren.fields.sentenceFurigana);
+  assert.ok(fake.state.notes.some((note) => note.modelName === "Lapis v1" && note.fields.Expression === "鰹節"
+    && note.fields.SelectionText.includes("<br>")));
+  assert.ok(fake.state.notes.some((note) => note.fields.Expression === "鰐" && note.fields.ExpressionReading === "コ"
+    && note.fields.MainDefinition === "しゃち, しゃちほこ" && note.fields.Hint === "19"), "a kanji entry's note");
+  // Dictionary images: stored once under their path's name, a refused store and a missing image fail the write.
+  assert.equal(Object.keys(fake.state.media).filter((name) => name.endsWith(".png")).length, 1);
+  assert.ok(submitted.some((reply) => reply.ok === false && reply.error === "AnkiConnect: media folder is read-only"));
+  assert.ok(submitted.some((reply) => reply.ok === false && reply.error === "The dictionary image is no longer available or is malformed."));
   assert.ok(Object.keys(fake.state.media).some((name) => name.startsWith("hachidori-screenshot-")), "a screenshot was stored");
   assert.ok(Object.keys(fake.state.media).some((name) => /^hachidori_[0-9a-f]{64}\.mp3$/u.test(name)), "a pronunciation was stored");
   const rendered = checks.flatMap((params) => params.notes).map((note) => note.fields);

@@ -96,17 +96,21 @@ struct Browser {
 
 impl Browser {
     async fn connect(relay: &Arc<Shared>, snapshot: Value) -> Self {
+        Self::offering(relay, snapshot, &["hoshidicts-api-v1"]).await
+    }
+
+    async fn offering(relay: &Arc<Shared>, snapshot: Value, capabilities: &[&str]) -> Self {
         let (peer, frames) = SocketPeer::new(usize::MAX);
         let role = relay.connect_host(Peer::Socket(peer)).expect("the browser host is accepted");
         let mut browser = Self { relay: relay.clone(), role, frames, client: String::new() };
         assert_eq!(browser.next().await["kind"], "listening");
         let open = browser.next().await;
         assert_eq!(open["kind"], "client-open");
-        assert_eq!(open["origin"], "relay://yomitan-api");
+        assert_eq!(open["origin"], "relay://hachidori-relay");
         browser.client = open["clientId"].as_str().expect("id").to_owned();
         assert_eq!(browser.said().await["kind"], "hello");
         browser
-            .says(&json!({ "kind": "hello", "protocol": 1, "version": "0.9.0", "name": "Chrome", "capabilities": ["hoshidicts-api-v1"], "snapshot": snapshot }))
+            .says(&json!({ "kind": "hello", "protocol": 1, "version": "0.9.0", "name": "Chrome", "capabilities": capabilities, "snapshot": snapshot }))
             .await;
         browser
     }
@@ -237,6 +241,27 @@ async fn the_browser_host_is_mirrored_and_the_mirror_outlives_it() {
     assert_eq!(hello["snapshot"]["options"], json!({ "scanLength": 30 }));
     assert_eq!(hello["snapshot"]["dictionaryState"], dictionary_state(GENERATION_2));
     let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn a_browser_host_with_profiles_is_mirrored_as_stored() {
+    let dir = data_dir("opt-in");
+    let (relay, stop) = relay(&dir);
+    let (mut linked, _) = Linked::hello(&relay).await;
+    let japanese = json!({ "options": { "scanLength": 20 } });
+    let mut browser = Browser::offering(&relay, japanese, &["hoshidicts-api-v1", "language-profiles-v1"]).await;
+    let opt_in = browser.said().await;
+    assert_eq!(opt_in["message"]["type"], "hd_language_profiles_opt_in");
+    let languages = opt_in["message"]["languages"].as_array().expect("languages");
+    assert!(languages.contains(&json!("en")) && !languages.contains(&json!("ja")), "{languages:?}");
+    // A change frame before the reply is the Japanese view, older than the reply.
+    browser.broadcast(&json!({ "kind": "storage", "changes": { "options": { "scanLength": 21 } } })).await;
+    let options = json!({ "scanLength": 40, "profiles": { "en": { "scanLength": 9 } } });
+    browser.says(&json!({ "kind": "reply", "id": opt_in["id"], "response": { "ok": true, "optIn": "accepted", "snapshot": { "options": options } } })).await;
+    assert_eq!(linked.until("storage").await["changes"]["options"], options, "only the records as stored are mirrored");
+    assert_eq!(stored(&dir)["options"], options);
+    browser.leave().await;
+    let _ = stop.send(true);
 }
 
 #[tokio::test]

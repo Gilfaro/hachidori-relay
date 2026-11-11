@@ -4,6 +4,7 @@
 //! index for one Template's source.
 
 use std::collections::{BTreeSet, HashMap};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use icu_normalizer::ComposingNormalizerBorrowed;
 use serde_json::{Map, Value, json};
@@ -72,9 +73,9 @@ fn search_token(operator: &str, value: &str) -> String {
     format!("\"{}:{}\"", escape_query(operator), escape_query(value))
 }
 
-/// `directExpressionFields`: the name keys of the fields whose Template is exactly
-/// `{expression}`, sorted.
-fn direct_expression_fields(config: &Map<String, Value>, names: Option<&[String]>) -> Vec<String> {
+/// The note fields whose Templates hold just `{expression}`, as named in the
+/// Templates, one per name key.
+fn direct_expression_names(config: &Map<String, Value>, names: Option<&[String]>) -> Vec<String> {
     let default_names: Vec<String>;
     let names = if let Some(names) = names {
         names
@@ -93,13 +94,19 @@ fn direct_expression_fields(config: &Map<String, Value>, names: Option<&[String]
     let mut fields: Vec<String> = Vec::new();
     for (field, template) in &resolved.templates {
         let value = template.get("value").and_then(Value::as_str).unwrap_or_default();
-        if value.eq_ignore_ascii_case("{expression}") && !SEARCH_OPERATORS.contains(&field.to_lowercase().as_str()) {
-            let key = name_key(field);
-            if !fields.contains(&key) {
-                fields.push(key);
-            }
+        if value.eq_ignore_ascii_case("{expression}")
+            && !SEARCH_OPERATORS.contains(&field.to_lowercase().as_str())
+            && !fields.iter().any(|known| name_key(known) == name_key(field))
+        {
+            fields.push(field.clone());
         }
     }
+    fields
+}
+
+/// `directExpressionFields`: name keys, sorted.
+fn name_keys(names: &[String]) -> Vec<String> {
+    let mut fields: Vec<String> = names.iter().map(|name| name_key(name)).collect();
     fields.sort_by(|left, right| js::compare(left, right));
     fields
 }
@@ -124,7 +131,12 @@ pub(crate) struct Source {
     pub(crate) scope: String,
     pub(crate) model: String,
     pub(crate) fields: Vec<String>,
+    /// `fields` as the Templates name them, for field-limited note reads.
+    pub(crate) field_names: Vec<String>,
     pub(crate) deck: Option<String>,
+    /// The note-type families recognised beside the configured note type, for a
+    /// language without them (`[]`); `None` recognises every family.
+    pub(crate) families: Option<Vec<Value>>,
 }
 
 /// `ankiIndexSource(config)`, or `None` for a Template the index cannot key.
@@ -135,7 +147,8 @@ pub(crate) fn source(config: &Map<String, Value>) -> Option<Source> {
     }
     let default_url = options::defaults()["anki"]["url"].clone();
     let url = options::normalise_anki_connect_url(Some(config.get("url").unwrap_or(&default_url)))?;
-    let fields = direct_expression_fields(config, None);
+    let field_names = direct_expression_names(config, None);
+    let fields = name_keys(&field_names);
     if fields.is_empty() {
         return None;
     }
@@ -154,6 +167,13 @@ pub(crate) fn source(config: &Map<String, Value>) -> Option<Source> {
         serialized.push_str(",\"deck\":");
         serialized.push_str(&Value::from(deck.as_str()).to_string());
     }
+    // A language without note-type families recognises none beside the
+    // configured note type (docs/languages.md 12).
+    let families = config.get("noteTypeFamilies").and_then(Value::as_array).filter(|_| scope != "model").cloned();
+    if let Some(families) = &families {
+        serialized.push_str(",\"families\":");
+        serialized.push_str(&Value::Array(families.clone()).to_string());
+    }
     serialized.push('}');
     Some(Source {
         key: hex(&Sha256::digest(serialized.as_bytes())),
@@ -162,7 +182,9 @@ pub(crate) fn source(config: &Map<String, Value>) -> Option<Source> {
         scope,
         model: text("model").to_owned(),
         fields,
+        field_names,
         deck,
+        families,
     })
 }
 
@@ -170,24 +192,26 @@ pub(crate) fn source(config: &Map<String, Value>) -> Option<Source> {
 struct Model {
     name: String,
     fields: Vec<String>,
+    /// `fields` as named, for field-limited note reads.
+    names: Vec<String>,
 }
 
 /// `recognizedModels`: the configured note type and, beyond model scope, every
 /// recognised Senren, Lapis or Kiku note type.
 fn recognized_models(invoke: &Invoke<'_>, source: &Source) -> Result<Vec<Model>> {
     if source.scope == "model" {
-        return Ok(vec![Model { name: source.model.clone(), fields: source.fields.clone() }]);
+        return Ok(vec![Model { name: source.model.clone(), fields: source.fields.clone(), names: source.field_names.clone() }]);
     }
     let available = invoke("modelNamesAndIds", json!({}), None)?;
     let available = setup::model_map(&available)?;
     let mut models = Vec::new();
     if available.get(&source.model).and_then(positive_id).is_some() {
-        models.push(Model { name: source.model.clone(), fields: source.fields.clone() });
+        models.push(Model { name: source.model.clone(), fields: source.fields.clone(), names: source.field_names.clone() });
     }
     let candidates: Vec<(&String, &str)> = available
         .iter()
         .filter(|(model, id)| **model != source.model && positive_id(id).is_some())
-        .filter_map(|(model, _)| setup::family(model).map(|family| (model, family)))
+        .filter_map(|(model, _)| listed_family(model, source.families.as_deref()).map(|family| (model, family)))
         .collect();
     if candidates.is_empty() {
         return Ok(models);
@@ -205,12 +229,19 @@ fn recognized_models(invoke: &Invoke<'_>, source: &Source) -> Result<Vec<Model>>
         let mut config = base.clone();
         config.insert("model".to_owned(), json!(model));
         config.insert("fieldTemplates".to_owned(), Value::Object(field_templates));
-        let expression_fields = direct_expression_fields(&config, Some(&fields));
-        if !expression_fields.is_empty() {
-            models.push(Model { name: model.clone(), fields: expression_fields });
+        let names = direct_expression_names(&config, Some(&fields));
+        if !names.is_empty() {
+            models.push(Model { name: model.clone(), fields: name_keys(&names), names });
         }
     }
     Ok(models)
+}
+
+/// `ankiListedFamily`: a model's family when the language lists it (`None`:
+/// every family).
+fn listed_family(model: &str, families: Option<&[Value]>) -> Option<&'static str> {
+    let family = setup::family(model)?;
+    families.is_none_or(|families| families.iter().any(|listed| listed == family)).then_some(family)
 }
 
 fn scoped_query(source: &Source, query: String) -> String {
@@ -307,6 +338,37 @@ fn indexed_notes<'a>(value: &Value, models: &'a [Model], expected: &[i64]) -> Re
     Ok(notes)
 }
 
+/// `indexedNotes` for `candidates`, reading only the models' expression fields
+/// where AnkiConnect supports it (`notesInfo`'s `noteFields`). Upstream
+/// AnkiConnect rejects the parameter and earlier versions ignore it; any reply
+/// the index cannot use as asked for falls back to full note records. A
+/// rejection is remembered until the relay restarts, so an AnkiConnect without
+/// it costs one extra request in all, not one per read (each is a poll
+/// interval on a popup's cache miss).
+static PROJECTION_REJECTED: AtomicBool = AtomicBool::new(false);
+
+fn read_indexed_notes<'a>(invoke: &Invoke<'_>, models: &'a [Model], candidates: &[i64], timeout: Option<u64>) -> Result<Vec<Note<'a>>> {
+    let mut names: Vec<&String> = Vec::new();
+    for name in models.iter().flat_map(|model| &model.names) {
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    if !names.is_empty() && !PROJECTION_REJECTED.load(Ordering::Relaxed) {
+        match invoke("notesInfo", json!({ "notes": candidates, "noteFields": names }), timeout) {
+            Ok(infos) => {
+                if let Ok(notes) = indexed_notes(&infos, models, candidates) {
+                    return Ok(notes);
+                }
+            }
+            Err(error) if error.message.contains("unexpected keyword argument") => PROJECTION_REJECTED.store(true, Ordering::Relaxed),
+            Err(error) => return Err(error),
+        }
+    }
+    let infos = invoke("notesInfo", json!({ "notes": candidates }), timeout)?;
+    indexed_notes(&infos, models, candidates)
+}
+
 /// `returnedNoteIds`: distinct and sorted.
 fn returned_note_ids(value: &Value, message: &str) -> Result<Vec<i64>> {
     let ids =
@@ -359,8 +421,7 @@ pub(crate) fn fetch(invoke: &Invoke<'_>, source: &Source) -> Result<Vec<Row>> {
     if candidates.is_empty() {
         return Ok(Vec::new());
     }
-    let infos = invoke("notesInfo", json!({ "notes": candidates }), Some(INDEX_TIMEOUT_MS))?;
-    Ok(compact_rows(&indexed_notes(&infos, &models, &candidates)?, &mature))
+    Ok(compact_rows(&read_indexed_notes(invoke, &models, &candidates, Some(INDEX_TIMEOUT_MS))?, &mature))
 }
 
 /// What a live lookup found for one word.
@@ -397,8 +458,7 @@ pub(crate) fn lookup_many(invoke: &Invoke<'_>, source: &Source, expressions: &[O
             let candidates = returned_note_ids(&replies[0], INVALID_IDS)?;
             mature = mature_note_ids(&replies[1], &candidates)?;
             if !candidates.is_empty() {
-                let infos = invoke("notesInfo", json!({ "notes": candidates }), None)?;
-                for note in indexed_notes(&infos, &models, &candidates)? {
+                for note in read_indexed_notes(invoke, &models, &candidates, None)? {
                     for field in &note.model.fields {
                         if let Some(found) = stored_word_key(note.value(field)).and_then(|key| matches.get_mut(&key)) {
                             found.insert(note.id);
@@ -492,11 +552,80 @@ mod tests {
         assert_eq!(source.fields, ["expression"]);
         assert_eq!(source.deck.as_deref(), Some("Mining"));
         assert_eq!(source.key.len(), 64);
-        let models = [Model { name: "Kiku".to_owned(), fields: source.fields.clone() }];
+        assert_eq!(source.field_names, ["Expression"]);
+        let models = [Model { name: "Kiku".to_owned(), fields: source.fields.clone(), names: source.field_names.clone() }];
         assert_eq!(complete_query(&source, &models).unwrap(), "\"note:Kiku\" \"deck:Mining\"");
         assert_eq!(
             lookup_query(&source, &models, &["猫", "犬"]).unwrap(),
             "(\"note:Kiku\" (\"expression:猫\" or \"expression:犬\")) \"deck:Mining\""
         );
+    }
+
+    // anki-index-languages.test.mjs: "a language without note-type families keys
+    // its source with them and recognises no family note type beside its own".
+    #[test]
+    fn a_language_without_families_keys_them_and_recognises_none_beside_its_own() {
+        let mut config = options::normalise(Some(&json!({ "anki": { "model": "English", "duplicateScope": "all",
+            "fields": { "expression": "Expression" } } })))["anki"]
+            .as_object()
+            .cloned()
+            .unwrap();
+        let japanese = source(&config).unwrap();
+        let mut english_config = config.clone();
+        english_config.insert("noteTypeFamilies".to_owned(), json!([]));
+        let english = source(&english_config).unwrap();
+        assert_eq!(japanese.families, None);
+        assert_eq!(english.families, Some(Vec::new()));
+        assert_ne!(english.key, japanese.key);
+        config.insert("duplicateScope".to_owned(), json!("model"));
+        let by_model = source(&config).unwrap().key;
+        config.insert("noteTypeFamilies".to_owned(), json!([]));
+        assert_eq!(source(&config).unwrap().key, by_model, "a note-type scope recognises nothing else");
+        let asked = std::cell::RefCell::new(Vec::new());
+        let invoke = |action: &str, params: Value, _: Option<u64>| -> Result<Value> {
+            asked.borrow_mut().push(action.to_owned());
+            match action {
+                "modelNamesAndIds" => Ok(json!({ "English": 1, "Kiku v2": 2 })),
+                "findNotes" => {
+                    assert!(!params["query"].as_str().unwrap().contains("Kiku"), "a Kiku note type is not an English duplicate");
+                    Ok(json!([]))
+                }
+                other => panic!("unexpected {other}"),
+            }
+        };
+        assert_eq!(fetch(&invoke, &english).unwrap(), Vec::<Row>::new());
+        assert_eq!(*asked.borrow(), ["modelNamesAndIds", "findNotes", "findNotes"]);
+    }
+
+    #[test]
+    fn index_reads_project_fields_and_fall_back_to_full_records() {
+        use std::cell::RefCell;
+        let models = [Model { name: "Lapis".to_owned(), fields: vec!["expression".to_owned()], names: vec!["Expression".to_owned()] }];
+        let full = json!([{ "noteId": 7, "modelName": "Lapis", "fields": {
+            "Expression": { "value": "猫", "order": 0 }, "Glossary": { "value": "<ol>…</ol>", "order": 1 } } }]);
+        let projected = json!([{ "noteId": 7, "modelName": "Lapis", "fields": { "Expression": { "value": "猫", "order": 0 } } }]);
+        let missing = json!([{ "noteId": 7, "modelName": "Lapis", "fields": {} }]);
+        let stock = "notesInfo() got an unexpected keyword argument 'noteFields'";
+        // What each server answers to a projected read; plain reads get full records.
+        // A rejection is last: after it, reads are plain (1 call).
+        for (answer, calls) in [(Ok(projected), 1), (Ok(full.clone()), 1), (Ok(missing), 2), (Err(stock), 2), (Ok(json!(null)), 1)] {
+            let sent = RefCell::new(Vec::new());
+            let invoke = |action: &str, params: Value, _: Option<u64>| -> Result<Value> {
+                assert_eq!(action, "notesInfo");
+                sent.borrow_mut().push(params.clone());
+                if params.get("noteFields").is_none() {
+                    return Ok(full.clone());
+                }
+                assert_eq!(params["noteFields"], json!(["Expression"]));
+                answer.clone().map_err(|error| Failure::new(gateway::describe(error)))
+            };
+            let notes = read_indexed_notes(&invoke, &models, &[7], None).unwrap();
+            assert_eq!(notes.len(), 1);
+            assert_eq!(notes[0].value("expression"), Some("猫"));
+            assert_eq!(sent.borrow().len(), calls);
+        }
+        // Other failures are not retried.
+        let invoke = |_: &str, _: Value, _: Option<u64>| -> Result<Value> { Err(Failure::new("AnkiConnect: collection is not available")) };
+        assert!(read_indexed_notes(&invoke, &models, &[7], None).is_err());
     }
 }

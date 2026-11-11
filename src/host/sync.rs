@@ -61,7 +61,8 @@ impl Sync {
     async fn follow(self: &Arc<Self>, host: u64, browser: &mut watch::Receiver<Option<u64>>, stop: &mut watch::Receiver<bool>) {
         let still_here = |browser: &watch::Receiver<Option<u64>>| *browser.borrow() == Some(host);
         let (news_sender, mut news) = mpsc::unbounded_channel();
-        let session = Session::pulling(self.relay.clone(), &self.version, self.lookup_timeout, news_sender);
+        let languages = super::engine::languages::host_languages().into_iter().filter(|code| *code != "ja").map(str::to_owned).collect();
+        let session = Session::pulling(self.relay.clone(), &self.version, self.lookup_timeout, news_sender, languages);
         if let Err(error) = session.ready().await {
             tracing::warn!(error = %error.message, "cannot pull from the browser host");
             while still_here(browser) {

@@ -8,12 +8,14 @@
 
 use serde_json::{Map, Value, json};
 
-use super::{custom, options};
+use super::profile_worker::{self, Coded};
+use super::{custom, options, profiles};
 use crate::host::js::{self, strict_eq};
+use crate::host::profile;
 use crate::host::store;
 
 /// The worker requests a linked browser forwards (`FORWARDED_REQUESTS`).
-pub(crate) const REQUESTS: [&str; 8] = [
+pub(crate) const REQUESTS: [&str; 9] = [
     "hd_state_read",
     "hd_state_cas",
     "hd_custom_read",
@@ -22,14 +24,20 @@ pub(crate) const REQUESTS: [&str; 8] = [
     "hd_lookup_stats_read",
     "hd_lookup_stats_record",
     "hd_word_status_override",
+    "hd_known_words_add",
 ];
 /// The capability of a linked client that edits Templates and Custom Buttons itself.
 pub(crate) const LINKED_ANKI_CAPABILITY: &str = "linked-anki-v2";
+/// The capability of a linked client that mines with the first Template and edits
+/// its legacy Anki fields and Custom Links.
+pub(crate) const LEGACY_LINKED_ANKI_CAPABILITY: &str = "linked-anki-v1";
 
-const OPTIONS_KEY: &str = "options";
+pub(crate) const OPTIONS_KEY: &str = "options";
 const LEGACY_DICTIONARIES_KEY: &str = "dictionaries";
-const LOOKUP_STATS_KEY: &str = "lookupStats";
-const WORD_STATUS_OVERRIDES_KEY: &str = "wordStatusOverrides";
+pub(crate) const LOOKUP_STATS_KEY: &str = "lookupStats";
+/// `JAPANESE_PROFILE_ID`: the language of a request that names no profile.
+const JAPANESE: &str = profile::JAPANESE;
+pub(crate) const WORD_STATUS_OVERRIDES_KEY: &str = "wordStatusOverrides";
 const OVERRIDE_STATUSES: [&str; 2] = ["known", "ignored"];
 const UPDATE_SCHEDULES: [&str; 5] = ["off", "hourly", "daily", "weekly", "monthly"];
 const SELECTION_KEYS: [&str; 4] =
@@ -43,32 +51,52 @@ pub(crate) trait Storage {
     fn read(&self, key: &str) -> Option<Value>;
     /// Writes `values` at once (`null` removes a key).
     fn write(&self, values: Map<String, Value>) -> std::result::Result<(), String>;
+    /// Every stored key with `prefix`; a store that cannot list its keys lists none.
+    fn keys_with(&self, _prefix: &str) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 type Result<T> = std::result::Result<T, String>;
 
-/// Answers one worker request with its reply (`workerReply` or `failureReply`).
+/// Who sent a worker request: this host's own engine, or a linked browser.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Sender {
+    Engine,
+    Linked,
+}
+
+/// Answers one request of a linked browser with its reply (`workerReply` or `failureReply`).
 pub(crate) fn handle(storage: &impl Storage, message: &Value, capabilities: &[String]) -> Value {
+    handle_from(storage, message, capabilities, Sender::Linked)
+}
+
+/// Answers one worker request from `sender`.
+pub(crate) fn handle_from(storage: &impl Storage, message: &Value, capabilities: &[String], sender: Sender) -> Value {
     let kind = message.get("type").and_then(Value::as_str).unwrap_or_default();
     let result = match kind {
         "hd_state_read" => Ok(state_read(storage)),
-        "hd_state_cas" => state_cas(storage, message),
-        "hd_custom_read" => custom_read(storage),
-        "hd_custom_cas" => custom_cas(storage, message),
+        "hd_state_cas" => state_cas(storage, message, sender),
+        "hd_custom_read" => custom_read(storage, message),
+        "hd_custom_cas" => custom_cas(storage, message, sender),
         "hd_options_write" => return options_write(storage, message, capabilities),
         "hd_lookup_stats_read" => lookup_stats(storage, message, false),
         "hd_lookup_stats_record" => lookup_stats(storage, message, true),
         "hd_word_status_override" => word_status_override(storage, message),
-        other => Err(format!("unknown worker request type {}", Value::from(other))),
+        "hd_known_words_add" => known_words_add(storage, message),
+        // The engine's one compare-and-set of hd_profile_add and hd_profile_remove.
+        "hd_profile_cas" if sender == Sender::Engine => profile_worker::profile_cas(storage, message),
+        "hd_profile_cas" => Err("Languages are added and removed only by the dictionary engine.".into()),
+        other => Err(format!("unknown worker request type {}", Value::from(other)).into()),
     };
     match result {
         Ok(result) => reply(message, result),
-        Err(error) => failure(message, &error),
+        Err(Coded { error, code }) => crate::host::local::failure_with_code(message, &error, code),
     }
 }
 
 /// `workerReply`.
-fn reply(message: &Value, mut result: Map<String, Value>) -> Value {
+pub(crate) fn reply(message: &Value, mut result: Map<String, Value>) -> Value {
     let ok = result.remove("ok").unwrap_or(Value::Bool(true));
     let error = result.remove("error").unwrap_or(Value::Null);
     let mut reply = Map::new();
@@ -80,11 +108,7 @@ fn reply(message: &Value, mut result: Map<String, Value>) -> Value {
     Value::Object(reply)
 }
 
-fn failure(message: &Value, error: &str) -> Value {
-    crate::host::local::failure(message, error)
-}
-
-fn object(value: Value) -> Map<String, Value> {
+pub(crate) fn object(value: Value) -> Map<String, Value> {
     match value {
         Value::Object(fields) => fields,
         _ => Map::new(),
@@ -92,7 +116,7 @@ fn object(value: Value) -> Map<String, Value> {
 }
 
 /// `{ ...value }` for what storage holds: an object's fields, nothing otherwise.
-fn spread(value: Option<&Value>) -> Map<String, Value> {
+pub(crate) fn spread(value: Option<&Value>) -> Map<String, Value> {
     value.and_then(Value::as_object).cloned().unwrap_or_default()
 }
 
@@ -106,20 +130,20 @@ fn listed<'a>(value: Option<&'a Value>, call: &str) -> Result<&'a [Value]> {
 }
 
 /// `readDictionaryStorage`: the dictionary state, `null` when there is none.
-fn stored_state(storage: &impl Storage) -> Value {
+pub(crate) fn stored_state(storage: &impl Storage) -> Value {
     storage.read(store::DICTIONARY_STATE).unwrap_or(Value::Null)
 }
 
-/// `assertDictionaryState`.
-fn assert_state(state: &Value) -> Result<()> {
-    if !state.is_null() && !strict_eq(state.get("schemaVersion"), Some(&json!(1))) {
+/// `assertDictionaryState`: schema 1, or a schema-2 state with profiles.
+pub(crate) fn assert_state(state: &Value) -> Result<()> {
+    if !state.is_null() && !strict_eq(state.get("schemaVersion"), Some(&json!(1))) && !profiles::has_dictionary_profiles(Some(state)) {
         return Err(format!("unsupported dictionary state schema {}", js::to_string(state.get("schemaVersion"))));
     }
     Ok(())
 }
 
 /// `current?.revision ?? 0`.
-fn state_revision(state: &Value) -> Value {
+pub(crate) fn state_revision(state: &Value) -> Value {
     state.get("revision").filter(|revision| !revision.is_null()).cloned().unwrap_or(json!(0))
 }
 
@@ -131,7 +155,12 @@ pub(crate) fn options_revision(options: Option<&Value>) -> f64 {
 fn state_read(storage: &impl Storage) -> Map<String, Value> {
     let state = stored_state(storage);
     let legacy = if state.is_null() { storage.read(LEGACY_DICTIONARIES_KEY).filter(Value::is_array) } else { None };
-    object(owned_json!({ "state": state, "legacyDictionaries": legacy }))
+    let mut read = object(owned_json!({ "state": state, "legacyDictionaries": legacy }));
+    let stored_options = storage.read(OPTIONS_KEY);
+    if profiles::has_profiles(stored_options.as_ref()) {
+        read.insert("languages".to_owned(), Value::from(profile_worker::distinct_languages(stored_options.as_ref())));
+    }
+    read
 }
 
 /// A `Set` key for a JSON value under `SameValueZero`; arrays and objects match nothing.
@@ -147,7 +176,7 @@ fn set_key(value: Option<&Value>) -> Option<String> {
 }
 
 /// `pruneGroupMemberships`.
-fn prune_groups(value: Option<&Value>, dictionaries: &[Value]) -> Result<Value> {
+pub(crate) fn prune_groups(value: Option<&Value>, dictionaries: &[Value]) -> Result<Value> {
     let Some(groups) = value.and_then(Value::as_array) else { return Ok(json!([])) };
     let mut installed = std::collections::HashSet::new();
     for dictionary in dictionaries {
@@ -181,7 +210,7 @@ fn prune_groups(value: Option<&Value>, dictionaries: &[Value]) -> Result<Value> 
 }
 
 /// `assertDictionaryUpdateSchedule` for each dictionary.
-fn assert_update_schedules(dictionaries: &[Value]) -> Result<()> {
+pub(crate) fn assert_update_schedules(dictionaries: &[Value]) -> Result<()> {
     for dictionary in dictionaries {
         if let Some(schedule) = js::property(Some(dictionary), "updateScheduleOverride")?.filter(|schedule| !schedule.is_null())
             && !schedule.as_str().is_some_and(|schedule| UPDATE_SCHEDULES.contains(&schedule))
@@ -221,7 +250,7 @@ fn committed_title(title: &Value, current: &Value, dictionaries: &[Value]) -> Re
 }
 
 /// `migrateCommittedDictionarySelections`.
-fn migrate_selections(mut options: Map<String, Value>, current: &Value, dictionaries: &[Value]) -> Result<Map<String, Value>> {
+pub(crate) fn migrate_selections(mut options: Map<String, Value>, current: &Value, dictionaries: &[Value]) -> Result<Map<String, Value>> {
     let migrate = |title: &Value| -> Result<Value> {
         if title.as_str().is_some_and(|title| !title.is_empty()) {
             committed_title(title, current, dictionaries)
@@ -294,31 +323,60 @@ fn dictionary_commit(
     Ok((state, values))
 }
 
-fn state_cas(storage: &impl Storage, message: &Value) -> Result<Map<String, Value>> {
+/// `assertOwnStateWrite`: only this host's engine writes a whole record.
+fn assert_own_state_write(sender: Sender) -> Result<()> {
+    if sender == Sender::Linked {
+        return Err("A linked Hachidori cannot replace this Hachidori's dictionary list.".to_owned());
+    }
+    Ok(())
+}
+
+fn state_cas(storage: &impl Storage, message: &Value, sender: Sender) -> profile_worker::Result<Map<String, Value>> {
     if js::whole(message.get("baseRevision")).is_none() {
-        return Err("the dictionary state write request carried no valid base revision".to_owned());
+        return Err("the dictionary state write request carried no valid base revision".into());
+    }
+    // The engine's own commits write the whole schema-2 record.
+    if message.get("state").is_some() {
+        assert_own_state_write(sender)?;
+        return profile_worker::whole_state_cas(storage, message);
     }
     let Some(dictionaries) = message.get("dictionaries").and_then(Value::as_array) else {
-        return Err("the dictionary state write request carried no list".to_owned());
+        return Err("the dictionary state write request carried no list".into());
     };
     let groups = message.get("groups");
     if groups.is_some_and(|groups| !groups.is_array()) {
-        return Err("the dictionary state write request carried invalid groups".to_owned());
+        return Err("the dictionary state write request carried invalid groups".into());
     }
     let current = stored_state(storage);
     let legacy = current.is_null() && storage.read(LEGACY_DICTIONARIES_KEY).is_some_and(|rows| rows.is_array());
+    let stored_options = storage.read(OPTIONS_KEY);
     assert_state(&current)?;
     if !strict_eq(message.get("baseRevision"), Some(&state_revision(&current))) {
         return Ok(object(json!({
             "ok": false, "conflict": true, "error": "the dictionary state changed while it was being written", "state": current,
         })));
     }
+    if profiles::has_profiles(stored_options.as_ref()) {
+        return match profile_worker::profile_view_commit(message, &current, stored_options.as_ref()) {
+            Ok((state, values)) => {
+                storage.write(values)?;
+                Ok(object(json!({ "state": state })))
+            }
+            Err(profile_worker::ViewRefusal::Profile(refused)) => Err(refused),
+            Err(profile_worker::ViewRefusal::Protected(error)) => {
+                Ok(object(json!({ "ok": false, "protected": true, "error": error, "state": current })))
+            }
+        };
+    }
+    if message.get("profileId").is_some() {
+        profile_worker::request_profile_id(message, stored_options.as_ref())?;
+    }
     let transition = listed(current.get("dictionaries"), "currentDictionaries.findIndex")
         .and_then(|before| custom::assert_ordinary_transition(before, dictionaries));
     if let Err(error) = transition {
         return Ok(object(json!({ "ok": false, "protected": true, "error": error, "state": current })));
     }
-    let (state, mut values) = dictionary_commit(&current, storage.read(OPTIONS_KEY).as_ref(), dictionaries, groups)?;
+    let (state, mut values) = dictionary_commit(&current, stored_options.as_ref(), dictionaries, groups)?;
     if legacy {
         values.insert(LEGACY_DICTIONARIES_KEY.to_owned(), Value::Null);
     }
@@ -326,37 +384,46 @@ fn state_cas(storage: &impl Storage, message: &Value) -> Result<Map<String, Valu
     Ok(object(owned_json!({ "state": state })))
 }
 
-fn custom_read(storage: &impl Storage) -> Result<Map<String, Value>> {
+fn custom_read(storage: &impl Storage, message: &Value) -> profile_worker::Result<Map<String, Value>> {
     let state = stored_state(storage);
     assert_state(&state)?;
-    let document = custom::normalise_document(storage.read(custom::CUSTOM_DICTIONARY_SOURCE_KEY).as_ref())?;
+    let language = profile_worker::custom_request_language(message, storage.read(OPTIONS_KEY).as_ref())?;
+    let document = custom::document_for(storage.read(custom::CUSTOM_DICTIONARY_SOURCE_KEY).as_ref(), &language)?;
     Ok(object(owned_json!({ "document": document, "state": state })))
 }
 
-fn custom_cas(storage: &impl Storage, message: &Value) -> Result<Map<String, Value>> {
+fn custom_cas(storage: &impl Storage, message: &Value, sender: Sender) -> profile_worker::Result<Map<String, Value>> {
     if js::whole(message.get("baseDocumentRevision")).is_none() {
-        return Err("the custom dictionary write carried no valid document revision".to_owned());
+        return Err("the custom dictionary write carried no valid document revision".into());
     }
     if js::whole(message.get("baseRevision")).is_none() {
-        return Err("the custom dictionary write carried no valid dictionary revision".to_owned());
+        return Err("the custom dictionary write carried no valid dictionary revision".into());
     }
     let (Some(text), Some(semantic)) =
         (message.get("text").and_then(Value::as_str), message.get("semanticRevision").and_then(Value::as_str))
     else {
-        return Err("the custom dictionary write carried no source document".to_owned());
+        return Err("the custom dictionary write carried no source document".into());
     };
-    let dictionaries = match message.get("dictionaries") {
+    // `customCasShape`: with the engine's whole record, the list fields are not read.
+    let whole = message.get("state").is_some();
+    let dictionaries = match message.get("dictionaries").filter(|_| !whole) {
         None => None,
         Some(Value::Array(dictionaries)) => Some(dictionaries.as_slice()),
-        Some(_) => return Err("the custom dictionary write carried an invalid dictionary list".to_owned()),
+        Some(_) => return Err("the custom dictionary write carried an invalid dictionary list".into()),
     };
-    if message.get("groups").is_some_and(|groups| !groups.is_array()) {
-        return Err("the custom dictionary write carried invalid groups".to_owned());
+    if !whole && message.get("groups").is_some_and(|groups| !groups.is_array()) {
+        return Err("the custom dictionary write carried invalid groups".into());
     }
     let current = stored_state(storage);
     let legacy = current.is_null() && storage.read(LEGACY_DICTIONARIES_KEY).is_some_and(|rows| rows.is_array());
     let stored_options = storage.read(OPTIONS_KEY);
     assert_state(&current)?;
+    if whole {
+        assert_own_state_write(sender)?;
+    }
+    if profile_worker::language_custom_request(message, stored_options.as_ref()) {
+        return profile_worker::language_custom_cas(storage, message);
+    }
     let document = custom::normalise_document(storage.read(custom::CUSTOM_DICTIONARY_SOURCE_KEY).as_ref())?;
     if !strict_eq(message.get("baseDocumentRevision"), document.get("revision")) {
         return Ok(object(json!({
@@ -370,16 +437,16 @@ fn custom_cas(storage: &impl Storage, message: &Value) -> Result<Map<String, Val
             "document": document, "state": current,
         })));
     }
-    let (entries, _) = custom::parse(text);
-    let revision = custom::semantic_revision(&entries)?;
+    let (entries, _) = custom::parse(text, true);
+    let revision = custom::semantic_revision(&entries, true)?;
     if revision != semantic {
-        return Err("the custom dictionary semantic revision does not match its source".to_owned());
+        return Err("the custom dictionary semantic revision does not match its source".into());
     }
     let checked = match dictionaries {
         Some(dictionaries) => dictionaries,
         None => listed(current.get("dictionaries"), "dictionaries.filter")?,
     };
-    custom::assert_source_state(checked, &revision, entries.len())?;
+    custom::assert_source_state(checked, &revision, entries.len(), &custom::japanese())?;
     let changed = document["text"].as_str() != Some(text) || document["semanticRevision"].as_str() != Some(semantic);
     let next_document = if changed {
         json!({
@@ -395,7 +462,7 @@ fn custom_cas(storage: &impl Storage, message: &Value) -> Result<Map<String, Val
         values.insert(custom::CUSTOM_DICTIONARY_SOURCE_KEY.to_owned(), next_document.clone());
     }
     if let Some(dictionaries) = dictionaries {
-        custom::assert_commit(dictionaries)?;
+        custom::assert_commit(dictionaries, &custom::japanese())?;
         let groups = message.get("groups").or_else(|| current.get("groups"));
         let next_groups = prune_groups(groups, dictionaries)?;
         let list = Value::Array(dictionaries.to_vec());
@@ -431,7 +498,11 @@ fn valid_request_id(value: Option<&Value>) -> bool {
 
 /// `boundResponseFailure` of an options write's failure.
 fn options_failure(message: &Value, error: &str) -> Value {
-    let mut reply = failure(message, error);
+    options_coded_failure(message, &Coded::from(error))
+}
+
+fn options_coded_failure(message: &Value, failed: &Coded) -> Value {
+    let mut reply = crate::host::local::failure_with_code(message, &failed.error, failed.code);
     if !valid_request_id(message.get("requestId")) {
         reply["requestId"] = Value::Null;
     }
@@ -456,23 +527,40 @@ fn options_write(storage: &impl Storage, message: &Value, capabilities: &[String
         let result = options_write_storage(storage, &message)?;
         let reply = reply(&message, result);
         if !options_frame_fits(&reply) {
-            return Err(OPTIONS_LIMIT.to_owned());
+            return Err(OPTIONS_LIMIT.into());
         }
         Ok(reply)
     });
-    result.unwrap_or_else(|error| options_failure(message, &error))
+    result.unwrap_or_else(|failed| options_coded_failure(message, &failed))
 }
 
 /// `WORKER_HANDLERS.hd_options_write` with `optionsWriteResult`.
-fn options_write_storage(storage: &impl Storage, message: &Value) -> Result<Map<String, Value>> {
+fn options_write_storage(storage: &impl Storage, message: &Value) -> profile_worker::Result<Map<String, Value>> {
     let patch = options::validate_patch(message.get("options"))?;
     let state = stored_state(storage);
     let stored = storage.read(OPTIONS_KEY);
     if js::whole(message.get("baseRevision")).is_none() {
-        return Err("the options write request carried no valid base revision".to_owned());
+        return Err("the options write request carried no valid base revision".into());
     }
     assert_state(&state)?;
     let revision = options_revision(stored.as_ref());
+    if profiles::has_profiles(stored.as_ref()) {
+        let result = profile_worker::options_write(message, &patch, &state, stored.as_ref())?;
+        if result.get("ok") != Some(&Value::Bool(false))
+            && result.get("options").and_then(|options| options.get("revision")) != Some(&js::number(revision))
+        {
+            storage.write(object(json!({ OPTIONS_KEY: result["options"] })))?;
+        }
+        return Ok(result);
+    }
+    // The single-profile shape: its only profile is Japanese, whose pack
+    // declares no settings of its own.
+    if message.get("profileId").is_some() {
+        profile_worker::request_profile_id(message, stored.as_ref())?;
+    }
+    if let Some(pack_settings) = message.get("packSettings") {
+        profiles::apply_pack_settings_patch(stored.as_ref(), Some(pack_settings), JAPANESE)?;
+    }
     let mut current = options::project_stored(stored.as_ref());
     current.insert("revision".to_owned(), js::number(revision));
     if !strict_eq(message.get("baseRevision"), Some(&js::number(revision))) {
@@ -504,14 +592,14 @@ fn options_write_storage(storage: &impl Storage, message: &Value) -> Result<Map<
 
 /// `compatibleLinkedWorkerMessage`: an options write from a client that predates
 /// Templates and Custom Buttons edits them as its legacy fields.
-fn compatible_options_message(storage: &impl Storage, message: &Value, capabilities: &[String]) -> Result<Value> {
+fn compatible_options_message(storage: &impl Storage, message: &Value, capabilities: &[String]) -> profile_worker::Result<Value> {
     if capabilities.iter().any(|capability| capability == LINKED_ANKI_CAPABILITY) {
         return Ok(message.clone());
     }
     let Some(patch) = message.get("options").and_then(Value::as_object) else { return Ok(message.clone()) };
     let rich_anki = patch.get("anki").and_then(Value::as_object).is_some_and(|anki| anki.contains_key("templates"));
     if patch.contains_key("customButtons") || rich_anki {
-        return Err(LINKED_SETTINGS_UPDATE_REQUIRED.to_owned());
+        return Err(LINKED_SETTINGS_UPDATE_REQUIRED.into());
     }
     if !patch.contains_key("customLinks") && !patch.contains_key("anki") {
         return Ok(message.clone());
@@ -627,12 +715,50 @@ fn lookup_term(term: Option<&Value>, reading: Option<&Value>) -> Result<(String,
 }
 
 /// `assertLookupStatsDescriptor`.
-fn assert_descriptor(descriptor: &Value) -> Result<()> {
+pub(crate) fn assert_descriptor(descriptor: &Value) -> Result<()> {
     let generation = descriptor.get("generation");
     let valid = js::truthy(Some(descriptor))
         && js::safe_integer(descriptor.get("revision")).is_some_and(|revision| revision >= 0.0)
-        && (generation == Some(&Value::Null) || generation.and_then(Value::as_str).is_some_and(|generation| !generation.is_empty()));
+        && (generation == Some(&Value::Null) || generation.and_then(Value::as_str).is_some_and(|generation| !generation.is_empty()))
+        && descriptor.get("languages").is_none_or(valid_language_generations);
     if valid { Ok(()) } else { Err("Invalid lookup statistics descriptor.".to_owned()) }
+}
+
+/// `validLanguageGenerations`: every counted language but Japanese, by its code,
+/// to the generation that keys its rows.
+fn valid_language_generations(languages: &Value) -> bool {
+    languages.as_object().is_some_and(|languages| {
+        languages.iter().all(|(code, generation)| {
+            (2..=3).contains(&code.len())
+                && code.bytes().all(|b| b.is_ascii_lowercase())
+                && code != "ja"
+                && generation.as_str().is_some_and(|generation| !generation.is_empty())
+        })
+    })
+}
+
+/// `lookupStatsLanguageView`: the descriptor whose generation keys `language`'s rows.
+fn lookup_stats_view(descriptor: &Value, language: &str) -> Value {
+    if language == "ja" {
+        return descriptor.clone();
+    }
+    let generation = descriptor.get("languages").and_then(|languages| languages.get(language)).cloned().unwrap_or(Value::Null);
+    json!({ "generation": generation, "revision": descriptor["revision"] })
+}
+
+/// `withLookupStatsGeneration`: one revision up, with `language`'s generation set.
+pub(crate) fn with_lookup_stats_generation(descriptor: &Value, language: &str, generation: &str) -> Result<Value> {
+    let mut next = descriptor.clone();
+    next["revision"] = js::number(js::to_number(descriptor.get("revision")) + 1.0);
+    if language == "ja" {
+        next["generation"] = json!(generation);
+    } else {
+        let mut languages = descriptor.get("languages").and_then(Value::as_object).cloned().unwrap_or_default();
+        languages.insert(language.to_owned(), json!(generation));
+        next["languages"] = Value::Object(languages);
+    }
+    assert_descriptor(&next)?;
+    Ok(next)
 }
 
 /// `assertLookupStatsRow`.
@@ -659,6 +785,23 @@ fn lookup_stats_key(descriptor: &Value, term: &str, reading: &str) -> String {
     format!("{}{}:{}", store::LOOKUP_STATS_ROW_PREFIX, descriptor.get("generation").unwrap_or(&Value::Null), json!([term, reading]))
 }
 
+/// `removeObsoleteLookupStatsRows` (`unreachableLookupStatsKeys`): the rows
+/// outside the committed descriptor's live generations, which nothing reaches.
+pub(crate) fn remove_obsolete_lookup_rows(storage: &impl Storage) -> Result<()> {
+    let descriptor = storage.read(LOOKUP_STATS_KEY).unwrap_or_else(|| json!({ "generation": null, "revision": 0 }));
+    assert_descriptor(&descriptor)?;
+    let prefix = |generation: &Value| format!("{}{}:", store::LOOKUP_STATS_ROW_PREFIX, generation);
+    let mut live = vec![prefix(descriptor.get("generation").unwrap_or(&Value::Null))];
+    live.extend(descriptor.get("languages").and_then(Value::as_object).into_iter().flatten().map(|(_, generation)| prefix(generation)));
+    let unused: Map<String, Value> = storage
+        .keys_with(store::LOOKUP_STATS_ROW_PREFIX)
+        .into_iter()
+        .filter(|key| !live.iter().any(|prefix| key.starts_with(prefix.as_str())))
+        .map(|key| (key, Value::Null))
+        .collect();
+    if unused.is_empty() { Ok(()) } else { storage.write(unused) }
+}
+
 /// `crypto.randomUUID()`.
 pub(crate) fn random_uuid() -> Result<String> {
     let mut bytes = [0u8; 16];
@@ -669,22 +812,52 @@ pub(crate) fn random_uuid() -> Result<String> {
     Ok(format!("{}-{}-{}-{}-{}", &hex[..8], &hex[8..12], &hex[12..16], &hex[16..20], &hex[20..]))
 }
 
-/// `lookupStatisticsStorage`.
-fn lookup_stats(storage: &impl Storage, message: &Value, record: bool) -> Result<Map<String, Value>> {
+/// `lookupStatisticsStorage`, and `languageLookupStatistics` once counts are kept
+/// per language: `language`'s rows, under its own generation, every other
+/// language's generation kept.
+fn lookup_stats(storage: &impl Storage, message: &Value, record: bool) -> profile_worker::Result<Map<String, Value>> {
     let (term, reading) = lookup_term(message.get("term"), message.get("reading"))?;
     let mut descriptor = storage.read(LOOKUP_STATS_KEY).unwrap_or_else(|| json!({ "generation": null, "revision": 0 }));
     assert_descriptor(&descriptor)?;
-    if storage.read(OPTIONS_KEY).is_some_and(|options| options.get("showLookupCounts") == Some(&Value::Bool(false))) {
-        return Ok(object(json!({ "descriptor": descriptor, "statistics": null })));
-    }
-    let key = lookup_stats_key(&descriptor, &term, &reading);
-    let mut row = if descriptor["generation"].is_null() { None } else { storage.read(&key) };
+    let stored_options = storage.read(OPTIONS_KEY);
+    let per_language = profiles::has_profiles(stored_options.as_ref()) || descriptor.get("languages").is_some();
+    let language = if per_language {
+        // `languageLookupStatistics`: the counts of the language of the profile
+        // the request is for.
+        let has_japanese = profiles::profiles(stored_options.as_ref()).iter().any(|profile| profile["id"] == JAPANESE);
+        let profile_id = if message.get("profileId").is_none() && !has_japanese {
+            None
+        } else {
+            Some(profile_worker::request_profile_id(message, stored_options.as_ref())?)
+        };
+        let language = match &profile_id {
+            None => JAPANESE.to_owned(),
+            Some(id) => profile_language(stored_options.as_ref(), id),
+        };
+        let projected = profiles::project_options(stored_options.as_ref(), profile_id.as_deref().unwrap_or(JAPANESE), true);
+        if projected.get("showLookupCounts") == Some(&Value::Bool(false)) {
+            return Ok(object(json!({ "descriptor": descriptor, "statistics": null })));
+        }
+        language
+    } else {
+        if message.get("profileId").is_some() {
+            profile_worker::request_profile_id(message, stored_options.as_ref())?;
+        }
+        if stored_options.as_ref().is_some_and(|options| options.get("showLookupCounts") == Some(&Value::Bool(false))) {
+            return Ok(object(json!({ "descriptor": descriptor, "statistics": null })));
+        }
+        JAPANESE.to_owned()
+    };
+    let language = language.as_str();
+    let view = lookup_stats_view(&descriptor, language);
+    let key = lookup_stats_key(&view, &term, &reading);
+    let mut row = if view["generation"].is_null() { None } else { storage.read(&key) };
     if record {
         let now = js::now();
         if let Some(previous) = &row {
             assert_row(previous)?;
             if previous["term"].as_str() != Some(term.as_str()) || previous["reading"].as_str() != Some(reading.as_str()) {
-                return Err("The lookup statistics row does not match its key.".to_owned());
+                return Err("The lookup statistics row does not match its key.".into());
             }
         }
         let previous = |key: &str| row.as_ref().and_then(|row| row[key].as_f64());
@@ -694,21 +867,28 @@ fn lookup_stats(storage: &impl Storage, message: &Value, record: bool) -> Result
             "lastLookedUpAt": js::number(previous("lastLookedUpAt").unwrap_or(now).max(now)),
         });
         assert_row(&next)?;
-        let generation = match &descriptor["generation"] {
-            Value::Null => json!(random_uuid()?),
-            generation => generation.clone(),
+        let revision = js::number(js::to_number(descriptor.get("revision")) + 1.0);
+        descriptor = if !per_language {
+            let generation = if view["generation"].is_null() { json!(random_uuid()?) } else { view["generation"].clone() };
+            json!({ "generation": generation, "revision": revision })
+        } else if view["generation"].is_null() {
+            // The language's first row creates its generation in the same write.
+            with_lookup_stats_generation(&descriptor, language, &random_uuid()?)?
+        } else {
+            let mut next = descriptor.clone();
+            next["revision"] = revision;
+            next
         };
-        descriptor = json!({ "generation": generation, "revision": js::number(js::to_number(descriptor.get("revision")) + 1.0) });
         assert_descriptor(&descriptor)?;
         let mut values = Map::new();
         values.insert(LOOKUP_STATS_KEY.to_owned(), descriptor.clone());
-        values.insert(lookup_stats_key(&descriptor, &term, &reading), next.clone());
+        values.insert(lookup_stats_key(&lookup_stats_view(&descriptor, language), &term, &reading), next.clone());
         storage.write(values)?;
         row = Some(next);
     } else if let Some(row) = &row {
         assert_row(row)?;
-        if lookup_stats_key(&descriptor, row["term"].as_str().unwrap_or_default(), row["reading"].as_str().unwrap_or_default()) != key {
-            return Err("The lookup statistics row does not match its key.".to_owned());
+        if lookup_stats_key(&view, row["term"].as_str().unwrap_or_default(), row["reading"].as_str().unwrap_or_default()) != key {
+            return Err("The lookup statistics row does not match its key.".into());
         }
     }
     let statistics = row.unwrap_or_else(|| json!({ "term": term, "reading": reading, "lookupCount": 0 }));
@@ -716,7 +896,7 @@ fn lookup_stats(storage: &impl Storage, message: &Value, record: bool) -> Result
 }
 
 /// `normaliseWordStatusOverrides`.
-fn normalise_overrides(value: Option<&Value>) -> Map<String, Value> {
+pub(crate) fn normalise_overrides(value: Option<&Value>) -> Map<String, Value> {
     let revision = js::safe_integer(value.and_then(|value| value.get("revision"))).filter(|revision| *revision >= 0.0).unwrap_or(0.0);
     let mut record = Map::new();
     record.insert("revision".to_owned(), js::number(revision));
@@ -735,21 +915,122 @@ fn normalise_overrides(value: Option<&Value>) -> Map<String, Value> {
     record
 }
 
-/// `hd_word_status_override` with `withWordStatusOverride`.
-fn word_status_override(storage: &impl Storage, message: &Value) -> Result<Map<String, Value>> {
-    let current = normalise_overrides(storage.read(WORD_STATUS_OVERRIDES_KEY).as_ref());
+/// `overrideLanguages`: every other language's marks, by language.
+fn override_languages(value: Option<&Value>) -> Option<&Map<String, Value>> {
+    value?.get("languages")?.as_object()
+}
+
+/// `wordStatusOverridesFor`: one language's marks as a record of their own, at the
+/// record's revision.
+pub(crate) fn overrides_for(value: Option<&Value>, language: &str) -> Map<String, Value> {
+    if language == "ja" {
+        return normalise_overrides(value);
+    }
+    let mut entry =
+        override_languages(value).and_then(|languages| languages.get(language)).and_then(Value::as_object).cloned().unwrap_or_default();
+    entry.insert("revision".to_owned(), value.and_then(|value| value.get("revision")).cloned().unwrap_or(Value::Null));
+    normalise_overrides(Some(&Value::Object(entry)))
+}
+
+/// `withLanguageWordStatusOverrides`: the record with `language`'s marks replaced by
+/// `record`'s and every other language's kept, at `record`'s revision.
+pub(crate) fn with_language_overrides(value: Option<&Value>, language: &str, record: Map<String, Value>) -> Value {
+    let marks = |record: &Map<String, Value>| json!({ "known": record["known"], "ignored": record["ignored"] });
+    let mut languages: Map<String, Value> = override_languages(value)
+        .into_iter()
+        .flatten()
+        .map(|(code, entry)| (code.clone(), marks(&normalise_overrides(Some(entry)))))
+        .collect();
+    let mut top = normalise_overrides(value);
+    if language == "ja" {
+        top = record;
+    } else {
+        languages.insert(language.to_owned(), marks(&record));
+        top.insert("revision".to_owned(), record["revision"].clone());
+    }
+    let empty = |list: &Value| list.as_array().is_none_or(Vec::is_empty);
+    languages.retain(|_, entry| !(empty(&entry["known"]) && empty(&entry["ignored"])));
+    if !languages.is_empty() {
+        top.insert("languages".to_owned(), Value::Object(languages));
+    }
+    Value::Object(top)
+}
+
+/// `hd_word_status_override` with `withLanguageWordStatusOverride`, for `language`'s
+/// marks: Japanese on a record without `languages` is `withWordStatusOverride`.
+/// The language of the profile `id`, which exists.
+fn profile_language(stored_options: Option<&Value>, id: &str) -> String {
+    profile_worker::profile_languages(stored_options)
+        .into_iter()
+        .find(|(profile, _)| profile == id)
+        .map_or_else(|| JAPANESE.to_owned(), |(_, language)| language)
+}
+
+/// The language of the profile a request names, Japanese when it names none.
+fn request_language(storage: &impl Storage, message: &Value) -> profile_worker::Result<String> {
+    if message.get("profileId").is_none() {
+        return Ok(JAPANESE.to_owned());
+    }
+    let stored_options = storage.read(OPTIONS_KEY);
+    let id = profile_worker::request_profile_id(message, stored_options.as_ref())?;
+    Ok(profile_language(stored_options.as_ref(), &id))
+}
+
+/// `hd_known_words_add` with `withKnownWords`: Settings' pasted list, one word per
+/// line, joins the language's known words in one revision and leaves its ignored
+/// list; `added` counts the words that were not known yet.
+fn known_words_add(storage: &impl Storage, message: &Value) -> profile_worker::Result<Map<String, Value>> {
+    let language = request_language(storage, message)?;
+    let stored = storage.read(WORD_STATUS_OVERRIDES_KEY);
+    let Some(text) = message.get("text").and_then(Value::as_str) else {
+        return Err("Known words must be text, one word per line.".into());
+    };
+    let current = overrides_for(stored.as_ref(), &language);
+    let words = |status: &str| current[status].as_array().cloned().unwrap_or_default();
+    let mut known = words("known");
+    let before = known.len();
+    // A set, as upstream's, so a long pasted list is merged once.
+    let mut seen: std::collections::HashSet<String> = known.iter().filter_map(Value::as_str).map(str::to_owned).collect();
+    // `text.split(/\r?\n/u)`, each line trimmed.
+    for line in text.split('\n') {
+        let word = js::trim(line.strip_suffix('\r').unwrap_or(line));
+        if !word.is_empty() && seen.insert(word.to_owned()) {
+            known.push(json!(word));
+        }
+    }
+    let added = known.len() - before;
+    if added == 0 {
+        return Ok(object(json!({ "revision": normalise_overrides(stored.as_ref())["revision"], "added": 0 })));
+    }
+    let ignored: Vec<Value> = words("ignored").into_iter().filter(|word| !word.as_str().is_some_and(|word| seen.contains(word))).collect();
+    let mut next = Map::new();
+    next.insert("revision".to_owned(), js::number(js::to_number(current.get("revision")) + 1.0));
+    next.insert("known".to_owned(), Value::Array(known));
+    next.insert("ignored".to_owned(), Value::Array(ignored));
+    let record = with_language_overrides(stored.as_ref(), &language, next);
+    storage.write(object(json!({ WORD_STATUS_OVERRIDES_KEY: record })))?;
+    Ok(object(json!({ "revision": normalise_overrides(Some(&record))["revision"], "added": added })))
+}
+
+/// `hd_word_status_override`: a request names the profile whose language the
+/// headword belongs to; the other languages' marks are kept.
+fn word_status_override(storage: &impl Storage, message: &Value) -> profile_worker::Result<Map<String, Value>> {
+    let language = request_language(storage, message)?;
+    let language = language.as_str();
+    let stored = storage.read(WORD_STATUS_OVERRIDES_KEY);
+    let current = overrides_for(stored.as_ref(), language);
     let Some(headword) = message.get("headword").and_then(Value::as_str).filter(|headword| !headword.is_empty()) else {
-        return Err("A word status override needs a headword.".to_owned());
+        return Err("A word status override needs a headword.".into());
     };
     let status = match message.get("status") {
         Some(Value::Null) => None,
         Some(Value::String(status)) if OVERRIDE_STATUSES.contains(&status.as_str()) => Some(status.as_str()),
-        _ => return Err("A word status override is known, ignored or null.".to_owned()),
+        _ => return Err("A word status override is known, ignored or null.".into()),
     };
     let listed = |status: &str| current[status].as_array().is_some_and(|words| words.iter().any(|word| word == headword));
     let existing = OVERRIDE_STATUSES.iter().copied().find(|status| listed(status));
     if existing == status {
-        return Ok(object(json!({ "revision": current["revision"] })));
+        return Ok(object(json!({ "revision": normalise_overrides(stored.as_ref())["revision"] })));
     }
     let revision = js::number(js::to_number(current.get("revision")) + 1.0);
     let mut next = Map::new();
@@ -761,23 +1042,54 @@ fn word_status_override(storage: &impl Storage, message: &Value) -> Result<Map<S
         }
         next.insert(candidate.to_owned(), Value::Array(words));
     }
+    let next = if language == "ja" && override_languages(stored.as_ref()).is_none() {
+        Value::Object(next)
+    } else {
+        with_language_overrides(stored.as_ref(), language, next)
+    };
     storage.write(object(json!({ WORD_STATUS_OVERRIDES_KEY: next })))?;
     Ok(object(json!({ "revision": revision })))
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::cell::RefCell;
     use std::collections::BTreeMap;
 
     use super::*;
 
+    /// Upstream's dictionary-update-schedule.test.mjs, first case: what a
+    /// per-dictionary schedule may be.
+    #[test]
+    fn per_dictionary_schedules_are_inherit_or_a_policy() {
+        for value in [
+            None,
+            Some(json!(null)),
+            Some(json!("off")),
+            Some(json!("hourly")),
+            Some(json!("daily")),
+            Some(json!("weekly")),
+            Some(json!("monthly")),
+        ] {
+            let dictionary = value.map_or_else(|| json!({}), |value| json!({ "updateScheduleOverride": value }));
+            assert_eq!(assert_update_schedules(&[dictionary]), Ok(()));
+        }
+        for value in [json!(false), json!("inherit"), json!("sometimes")] {
+            let refused = assert_update_schedules(&[json!({ "updateScheduleOverride": value })]).unwrap_err();
+            assert!(refused.contains("schedule"), "{refused}");
+        }
+    }
+
     #[derive(Default)]
-    struct Memory(RefCell<BTreeMap<String, Value>>);
+    pub(crate) struct Memory(pub(crate) RefCell<BTreeMap<String, Value>>);
 
     impl Storage for Memory {
         fn read(&self, key: &str) -> Option<Value> {
             self.0.borrow().get(key).cloned()
+        }
+
+        fn keys_with(&self, prefix: &str) -> Vec<String> {
+            self.0.borrow().keys().filter(|key| key.starts_with(prefix)).cloned().collect()
         }
 
         fn write(&self, values: Map<String, Value>) -> std::result::Result<(), String> {
@@ -791,6 +1103,13 @@ mod tests {
             }
             Ok(())
         }
+    }
+
+    /// Options with a Japanese profile and one for each of `languages`.
+    fn with_profiles(storage: &Memory, languages: &[&str]) {
+        let mut list = vec![json!({ "id": "ja", "language": "ja", "settings": {} })];
+        list.extend(languages.iter().map(|code| json!({ "id": code, "language": code, "settings": {} })));
+        storage.write(object(json!({ OPTIONS_KEY: { "revision": 1, "profiles": list } }))).unwrap();
     }
 
     fn request(storage: &Memory, fields: &Value) -> Value {
@@ -825,6 +1144,92 @@ mod tests {
         let options = storage.read("options").unwrap_or_default();
         assert_eq!((options["revision"].clone(), options["frequencyDictionary"].clone()), (json!(5), json!("Freq 2")));
         assert_eq!(options["kanjiClickDictionary"], "");
+    }
+
+    // A host with language profiles keeps other languages' marks under
+    // `languages` (word-status-overrides.js): a Japanese mark keeps them, a
+    // language's last mark cleared drops its entry, and a malformed record is
+    // normalised as the extension normalises it.
+    #[test]
+    fn word_status_marks_of_other_languages_are_kept() {
+        let storage = Memory::default();
+        storage
+            .write(object(json!({ WORD_STATUS_OVERRIDES_KEY: {
+            "revision": 4, "known": ["猫", 7, "猫", ""], "ignored": ["猫", "犬"],
+            "languages": { "en": { "known": ["cat"], "ignored": ["cat", "dog"] } },
+        } })))
+            .unwrap();
+        let japanese = request(&storage, &json!({ "type": "hd_word_status_override", "headword": "鳥", "status": "known" }));
+        assert_eq!(japanese["revision"], 5);
+        assert_eq!(
+            storage.read(WORD_STATUS_OVERRIDES_KEY).unwrap(),
+            json!({ "revision": 5, "known": ["猫", "鳥"], "ignored": ["犬"], "languages": { "en": { "known": ["cat"], "ignored": ["dog"] } } })
+        );
+        assert_eq!(overrides_for(storage.read(WORD_STATUS_OVERRIDES_KEY).as_ref(), "en")["known"], json!(["cat"]));
+        with_profiles(&storage, &["en"]);
+        let english = word_status_override(&storage, &json!({ "headword": "cat", "status": null, "profileId": "en" })).unwrap();
+        assert_eq!(english["revision"], 6);
+        let english = word_status_override(&storage, &json!({ "headword": "dog", "status": null, "profileId": "en" })).unwrap();
+        assert_eq!(english["revision"], 7);
+        assert_eq!(storage.read(WORD_STATUS_OVERRIDES_KEY).unwrap(), json!({ "revision": 7, "known": ["猫", "鳥"], "ignored": ["犬"] }));
+        word_status_override(&storage, &json!({ "headword": "bird", "status": "ignored", "profileId": "en" })).unwrap();
+        assert_eq!(storage.read(WORD_STATUS_OVERRIDES_KEY).unwrap()["languages"], json!({ "en": { "known": [], "ignored": ["bird"] } }));
+    }
+
+    /// Upstream's word-status-overrides.test.mjs "pasted known words append once,
+    /// move ignored words and keep other languages", through `hd_known_words_add`.
+    #[test]
+    fn pasted_known_words_append_once() {
+        let storage = Memory::default();
+        let stored = json!({ "revision": 4, "known": ["猫"], "ignored": ["犬", "さん"],
+            "languages": { "en": { "known": ["cat"], "ignored": ["dog"] } } });
+        storage.write(object(json!({ WORD_STATUS_OVERRIDES_KEY: stored }))).unwrap();
+        let reply = request(&storage, &json!({ "type": "hd_known_words_add", "text": " 猫 \r\n犬\r\n\n学校\n学校\n " }));
+        assert_eq!((reply["ok"].clone(), reply["revision"].clone(), reply["added"].clone()), (json!(true), json!(5), json!(2)));
+        let record = json!({ "revision": 5, "known": ["猫", "犬", "学校"], "ignored": ["さん"],
+            "languages": { "en": { "known": ["cat"], "ignored": ["dog"] } } });
+        assert_eq!(storage.read(WORD_STATUS_OVERRIDES_KEY).unwrap(), record);
+        for text in ["", " \r\n ", "猫\n犬\n学校"] {
+            let reply = request(&storage, &json!({ "type": "hd_known_words_add", "text": text }));
+            assert_eq!((reply["revision"].clone(), reply["added"].clone()), (json!(5), json!(0)), "{text:?}");
+            assert_eq!(storage.read(WORD_STATUS_OVERRIDES_KEY).unwrap(), record);
+        }
+        with_profiles(&storage, &["en"]);
+        let english = request(&storage, &json!({ "type": "hd_known_words_add", "text": "dog\nice cream", "profileId": "en" }));
+        assert_eq!(english["added"], 2);
+        assert_eq!(
+            storage.read(WORD_STATUS_OVERRIDES_KEY).unwrap()["languages"],
+            json!({ "en": { "known": ["cat", "dog", "ice cream"], "ignored": [] } })
+        );
+        let refused = request(&storage, &json!({ "type": "hd_known_words_add", "text": 3 }));
+        assert_eq!(refused["error"], "Known words must be text, one word per line.");
+        let missing = request(&storage, &json!({ "type": "hd_known_words_add", "text": "x", "profileId": "fr" }));
+        assert_eq!(missing["ok"], false);
+    }
+
+    // Lookup counts per language (lookup-stats.js): Japanese's generation at
+    // the top, every other language's under `languages`, all kept by a write.
+    #[test]
+    fn lookup_counts_of_other_languages_are_kept() {
+        let storage = Memory::default();
+        storage.write(object(json!({ LOOKUP_STATS_KEY: { "generation": "g-ja", "revision": 3, "languages": { "en": "g-en" } } }))).unwrap();
+        let japanese = request(&storage, &json!({ "type": "hd_lookup_stats_record", "term": "猫" }));
+        assert_eq!(japanese["descriptor"], json!({ "generation": "g-ja", "revision": 4, "languages": { "en": "g-en" } }));
+        assert!(storage.read(&lookup_stats_key(&json!({ "generation": "g-ja" }), "猫", "")).is_some());
+        with_profiles(&storage, &["en", "fr"]);
+        let english = lookup_stats(&storage, &json!({ "term": "cat", "profileId": "en" }), true).unwrap();
+        assert_eq!(english["descriptor"]["revision"], 5);
+        assert_eq!(english["statistics"]["lookupCount"], 1);
+        assert!(storage.read(&lookup_stats_key(&json!({ "generation": "g-en" }), "cat", "")).is_some());
+        let french = lookup_stats(&storage, &json!({ "term": "chat", "profileId": "fr" }), true).unwrap();
+        let generation = french["descriptor"]["languages"]["fr"].as_str().unwrap().to_owned();
+        assert_eq!(french["descriptor"]["languages"]["en"], "g-en");
+        assert!(storage.read(&lookup_stats_key(&json!({ "generation": generation }), "chat", "")).is_some());
+        for languages in [json!({ "ja": "g" }), json!({ "EN": "g" }), json!({ "en": "" }), json!([])] {
+            storage.write(object(json!({ LOOKUP_STATS_KEY: { "generation": null, "revision": 0, "languages": languages } }))).unwrap();
+            let refused = request(&storage, &json!({ "type": "hd_lookup_stats_read", "term": "猫" }));
+            assert_eq!(refused["error"], "Invalid lookup statistics descriptor.", "{languages}");
+        }
     }
 
     #[test]

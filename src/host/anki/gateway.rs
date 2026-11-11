@@ -41,6 +41,12 @@ impl Failure {
     pub(crate) fn undispatched(&self) -> bool {
         self.transport == Some(false)
     }
+
+    /// `isAnkiEditorConflict`: AnkiConnect refused, before writing anything, to
+    /// change a note that Anki's Browser or an Edit window shows (#698).
+    pub(crate) fn editor_conflict(&self) -> bool {
+        contains_folded(&self.message, EDITOR_CONFLICT)
+    }
 }
 
 impl From<String> for Failure {
@@ -87,6 +93,9 @@ fn after_prefix<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
     head.eq_ignore_ascii_case(prefix).then(|| &text[prefix.len()..])
 }
 
+/// `EDITOR_CONFLICT`, lower-cased.
+const EDITOR_CONFLICT: &str = "close the affected editor before this api write";
+
 fn contains_folded(text: &str, needle: &str) -> bool {
     text.to_ascii_lowercase().contains(needle)
 }
@@ -121,6 +130,12 @@ pub(crate) fn explain(error: &str) -> Option<String> {
     }
     if let Some(id) = rest("note was not found: ") {
         return keep(format!("Anki no longer has note {id}. It was deleted or moved to another collection; refresh and retry."));
+    }
+    if contains_folded(error, EDITOR_CONFLICT) {
+        return keep(
+            "Anki did not change the note because its Browser or an Edit window has it open. Close that window, or select another card in the Browser, then try again."
+                .to_owned(),
+        );
     }
     if contains_folded(error, "unsupported action") || contains_folded(error, "unknown action") {
         return keep("The installed AnkiConnect add-on is too old for this request. Update AnkiConnect in Anki.".to_owned());
@@ -343,12 +358,13 @@ fn dispatch(url: &str, body: &str, timeout_ms: u64) -> Result<Value> {
             true,
         )
     };
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .max_redirects(0)
-        .http_status_as_error(false)
-        .timeout_global(Some(Duration::from_millis(timeout_ms)))
-        .build()
-        .into();
+    let agent = crate::host::loopback::agent(
+        ureq::Agent::config_builder()
+            .max_redirects(0)
+            .http_status_as_error(false)
+            .timeout_global(Some(Duration::from_millis(timeout_ms)))
+            .build(),
+    );
     let response = agent
         .post(url)
         .header("Content-Type", "application/json")
@@ -452,12 +468,116 @@ mod tests {
         assert!(describe("Unsupported action: findModelsByName").ends_with("(AnkiConnect: Unsupported action: findModelsByName)"));
     }
 
+    /// #698: an open editor's refusal is explained, keeps AnkiConnect's text, and
+    /// is told apart from a write that may have happened.
+    #[test]
+    fn an_open_editor_refusal_is_a_definite_failure() {
+        let raw = "Close the affected editor before this API write, even if its content is saved.";
+        let described = describe(raw);
+        assert!(described.starts_with("Anki did not change the note because its Browser or an Edit window has it open."), "{described}");
+        assert!(described.ends_with(&format!("(AnkiConnect: {raw})")));
+        assert!(Failure::new(described).editor_conflict());
+        assert!(!Failure::new(describe("collection is not available")).editor_conflict());
+    }
+
     #[test]
     fn envelopes_are_exact() {
         assert!(is_envelope(&json!({ "result": 1, "error": null })));
         assert!(!is_envelope(&json!({ "result": 1, "error": null, "extra": 0 })));
         assert!(!is_envelope(&json!({ "result": 1, "error": 3 })));
         assert!(!is_envelope(&json!([1])));
+    }
+
+    /// A loopback AnkiConnect that answers each request after `hold`, counting
+    /// the most it held at once; an action named `fail` gets an API error.
+    fn held_anki(hold: Duration) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::{Read as _, Write as _};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (active, most) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let peak = Arc::clone(&most);
+        std::thread::spawn(move || {
+            for socket in listener.incoming() {
+                let Ok(mut socket) = socket else { continue };
+                let (active, most) = (Arc::clone(&active), Arc::clone(&most));
+                std::thread::spawn(move || {
+                    let mut request = Vec::new();
+                    let mut buffer = [0u8; 4096];
+                    let body = loop {
+                        let Ok(read) = socket.read(&mut buffer) else { return };
+                        if read == 0 {
+                            return;
+                        }
+                        request.extend_from_slice(&buffer[..read]);
+                        let text = String::from_utf8_lossy(&request).into_owned();
+                        if let Some((head, body)) = text.split_once("\r\n\r\n") {
+                            let length = head
+                                .lines()
+                                .find_map(|line| {
+                                    line.to_ascii_lowercase()
+                                        .strip_prefix("content-length:")
+                                        .map(|n| n.trim().parse::<usize>().unwrap_or(0))
+                                })
+                                .unwrap_or(0);
+                            if body.len() >= length {
+                                break body.to_owned();
+                            }
+                        }
+                    };
+                    let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    most.fetch_max(now, Ordering::SeqCst);
+                    std::thread::sleep(hold);
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    let reply = if body.contains("\"action\":\"fail\"") {
+                        r#"{"result":null,"error":"failed"}"#
+                    } else {
+                        r#"{"result":6,"error":null}"#
+                    };
+                    let _ = write!(
+                        socket,
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{reply}",
+                        reply.len()
+                    );
+                });
+            }
+        });
+        (url, peak)
+    }
+
+    /// Upstream's anki.test.mjs "Anki requests use bounded endpoint lanes and
+    /// start each timeout only when transport dispatches", "Anki queues are
+    /// isolated by normalized endpoint" and "Anki API failures do not poison
+    /// unrelated queued requests".
+    #[test]
+    fn requests_use_bounded_lanes_per_endpoint() {
+        use std::sync::atomic::Ordering;
+        let hold = Duration::from_millis(600);
+        let (busy, peak) = held_anki(hold);
+        let (quiet, _) = held_anki(Duration::ZERO);
+        let gateway = Arc::new(Gateway::default());
+        let started = std::time::Instant::now();
+        let calls: Vec<_> = (0..2 * LANES)
+            .map(|n| {
+                let (gateway, busy) = (Arc::clone(&gateway), busy.clone());
+                let action = if n == 1 { "fail" } else { "version" };
+                // Each waits about one hold for a lane: a timeout started at enqueue would expire.
+                std::thread::spawn(move || gateway.invoke(action, &Value::Null, "", 900, Some(&json!(busy))))
+            })
+            .collect();
+        std::thread::sleep(Duration::from_millis(100));
+        let elsewhere = std::time::Instant::now();
+        assert_eq!(gateway.invoke("version", &Value::Null, "", 900, Some(&json!(quiet))).ok(), Some(json!(6)));
+        assert!(elsewhere.elapsed() < hold / 2, "another endpoint's queue does not wait: {:?}", elsewhere.elapsed());
+        let outcomes: Vec<_> = calls.into_iter().map(|call| call.join().unwrap()).collect();
+        assert!(started.elapsed() >= hold * 2, "the second half waited for lanes");
+        assert_eq!(peak.load(Ordering::SeqCst), LANES);
+        for (n, outcome) in outcomes.iter().enumerate() {
+            match n {
+                1 => assert_eq!(outcome.as_ref().unwrap_err().message, "AnkiConnect: failed"),
+                _ => assert_eq!(outcome.as_ref().ok(), Some(&json!(6)), "request {n}: {:?}", outcome.as_ref().err().map(|e| &e.message)),
+            }
+        }
     }
 
     #[test]

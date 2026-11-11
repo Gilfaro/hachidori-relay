@@ -158,11 +158,46 @@ function addNote(state, note, AnkiConnectError) {
   return noteId;
 }
 
+// Fault switches: `state.faults` lists faults armed for the next matching
+// actions, each used once, in order. A fault names its `action` and, with
+// `after`, fires only once that action has run since the faults were armed,
+// and with `filter`, only for the parameters it accepts:
+// - `error`: the add-on refuses the action with `message`;
+// - `edit`: `edit(state, params)` changes the collection before the action
+//   runs (`when: "before"`, the default) or after it (`when: "after"`), as an
+//   add-on rewrite, an edit in Anki or another client would;
+// - `lost-store`: a media store is acknowledged and not kept;
+// - `result`: the action answers `result` instead of running (a malformed reply);
+// - `drop-before` and `drop-after`: the connection closes before the request
+//   is dispatched, or after it ran, so its outcome is unknown to the client.
+function takeFault(state, action, kinds, params) {
+  const index = state.faults.findIndex((fault) => fault.action === action && kinds.includes(fault.kind)
+    && (fault.after === undefined || state.ran.includes(fault.after)) && (fault.filter?.(params) ?? true));
+  return index < 0 ? null : state.faults.splice(index, 1)[0];
+}
+
 // The handler `answerAnkiConnect` runs: each action against the collection.
 export function handler(state, AnkiConnectError) {
   const byCard = (cards) => cards.map((id) => state.notes.find((note) => cardId(note) === id)).filter(Boolean);
   return (action, params) => {
     state.log.push({ action, params });
+    const fault = takeFault(state, action, ["error", "edit", "lost-store", "result"], params);
+    if (fault?.kind === "error") throw new AnkiConnectError(fault.message);
+    if (fault?.kind === "result") {
+      state.ran.push(action);
+      return fault.result;
+    }
+    if (fault?.kind === "edit" && fault.when !== "after") fault.edit(state, params);
+    if (fault?.kind === "lost-store") {
+      state.ran.push(action);
+      return params.filename;
+    }
+    const result = run(action, params);
+    state.ran.push(action);
+    if (fault?.kind === "edit" && fault.when === "after") fault.edit(state, params);
+    return result;
+  };
+  function run(action, params) {
     switch (action) {
       case "version": return 6;
       case "deckNames": return [...state.decks];
@@ -204,12 +239,15 @@ export function handler(state, AnkiConnectError) {
       case "deleteMediaFile": delete state.media[params.filename]; return null;
       default: throw new AnkiConnectError(`unsupported action: ${action}`);
     }
-  };
+  }
 }
+
+// The actions a request body runs: its own, or a `multi`'s.
+const bodyActions = (body) => (body?.action === "multi" ? body.params?.actions ?? [] : [body]);
 
 // The collection over HTTP; `state.log` holds every action, in order.
 export async function startAnkiConnect(answerAnkiConnect, AnkiConnectError) {
-  const state = { ...collection(), media: {}, log: [], refuse: false, audio: [], racing: [] };
+  const state = { ...collection(), media: {}, log: [], refuse: false, audio: [], racing: [], faults: [], ran: [] };
   const handle = handler(state, AnkiConnectError);
   const server = http.createServer((request, response) => {
     // Pronunciations: /audio/<term>.mp3 plays, /list/<term> lists it, /missing/ is 404.
@@ -234,7 +272,17 @@ export async function startAnkiConnect(answerAnkiConnect, AnkiConnectError) {
       }
       try {
         const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+        const drop = (kind) => bodyActions(body).some((entry) => takeFault(state, entry?.action, [kind], entry?.params));
+        if (drop("drop-before")) {
+          request.socket.destroy();
+          return;
+        }
+        const dropAfter = drop("drop-after");
         const reply = await answerAnkiConnect(body, handle);
+        if (dropAfter) {
+          request.socket.destroy();
+          return;
+        }
         response.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify(reply));
       } catch (error) {
         response.writeHead(500).end(String(error));

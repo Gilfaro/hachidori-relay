@@ -2,7 +2,7 @@
 //! The API's in-process relay client.
 //!
 //! It is an ordinary linked client (origin `relay://yomitan-api`, address
-//! `127.0.0.1`). It sends the sharing protocol's `hello`, then correlated `request`
+//! `127.0.0.1`; host mode's pull session uses `relay://hachidori-relay`). It sends the sharing protocol's `hello`, then correlated `request`
 //! frames, and it answers pings. The host replies as it would to any linked browser.
 
 use std::borrow::Cow;
@@ -25,6 +25,15 @@ use crate::ws::peer::{ApiEvent, Peer};
 /// The capability a host advertises when it serves the API, and that the session advertises too.
 pub(crate) const CAPABILITY: &str = "hoshidicts-api-v1";
 const API_ORIGIN: &str = "relay://yomitan-api";
+/// Host mode's pull session. Not the API's origin: a browser host whose records
+/// gain or change languages closes every other link (upstream docs/languages.md
+/// 17.3 item 6), and the mirror must link again to opt in afresh.
+const PULL_ORIGIN: &str = "relay://hachidori-relay";
+/// `LANGUAGE_PROFILES_CAPABILITY` and `LANGUAGE_PROFILES_OPT_IN`.
+const PROFILES_CAPABILITY: &str = "language-profiles-v1";
+const OPT_IN: &str = "hd_language_profiles_opt_in";
+/// The pull session's opt-in request.
+const OPT_IN_ID: &str = "pull-opt-in";
 const API_ADDRESS: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 const API_NAME: &str = "Hachidori Relay API";
 const PROTOCOL_VERSION: u32 = 1;
@@ -54,6 +63,9 @@ struct State {
     pending: HashMap<String, Waiter>,
     next_id: u64,
     capabilities: Vec<String>,
+    /// A pulling session's hello snapshot while its opt-in is answered: change
+    /// frames are dropped until then, as the opt-in's snapshot is newer.
+    opting: Option<Box<RawValue>>,
 }
 
 /// What a pulling session hears from the browser host besides replies (host mode).
@@ -73,6 +85,8 @@ pub(crate) struct Session {
     /// `Some` for host mode's pull session, which always talks to the browser host and
     /// reports what that host shares.
     news: Option<mpsc::UnboundedSender<HostNews>>,
+    /// The language packs a pulling session opts in with when the host offers profiles.
+    languages: Vec<String>,
     hello_version: String,
     lookup_timeout: Duration,
     state: Mutex<State>,
@@ -129,22 +143,44 @@ struct Inbound<'a> {
 
 impl Session {
     pub(crate) fn new(relay: Arc<Shared>, version: &str, lookup_timeout: Duration) -> Arc<Self> {
-        Self::with_news(relay, version, lookup_timeout, None)
+        Self::with_news(relay, version, lookup_timeout, None, Vec::new())
     }
 
-    /// Host mode's session toward the browser host, which reports the host's shared storage to `news`.
+    /// Host mode's session toward the browser host, which reports the host's shared
+    /// storage to `news`. A host that offers language profiles is asked for the
+    /// records as stored, with the relay's `languages` packs.
     #[cfg_attr(not(feature = "host"), allow(dead_code, reason = "used by host mode"))]
-    pub(crate) fn pulling(relay: Arc<Shared>, version: &str, lookup_timeout: Duration, news: mpsc::UnboundedSender<HostNews>) -> Arc<Self> {
-        Self::with_news(relay, version, lookup_timeout, Some(news))
+    pub(crate) fn pulling(
+        relay: Arc<Shared>,
+        version: &str,
+        lookup_timeout: Duration,
+        news: mpsc::UnboundedSender<HostNews>,
+        languages: Vec<String>,
+    ) -> Arc<Self> {
+        Self::with_news(relay, version, lookup_timeout, Some(news), languages)
     }
 
-    fn with_news(relay: Arc<Shared>, version: &str, lookup_timeout: Duration, news: Option<mpsc::UnboundedSender<HostNews>>) -> Arc<Self> {
+    fn with_news(
+        relay: Arc<Shared>,
+        version: &str,
+        lookup_timeout: Duration,
+        news: Option<mpsc::UnboundedSender<HostNews>>,
+        languages: Vec<String>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             relay,
             news,
+            languages,
             hello_version: format!("hachidori-relay/{version}"),
             lookup_timeout,
-            state: Mutex::new(State { alive: true, failure: None, pending: HashMap::new(), next_id: 0, capabilities: Vec::new() }),
+            state: Mutex::new(State {
+                alive: true,
+                failure: None,
+                pending: HashMap::new(),
+                next_id: 0,
+                capabilities: Vec::new(),
+                opting: None,
+            }),
             client: OnceLock::new(),
             hello: watch::channel(false).0,
             opening: tokio::sync::Mutex::new(false),
@@ -176,7 +212,7 @@ impl Session {
         if self.client.get().is_none() {
             let (events, receiver) = mpsc::unbounded_channel();
             let connected = if self.news.is_some() {
-                self.relay.connect_browser_client(Peer::Api(events), API_ORIGIN, API_ADDRESS)
+                self.relay.connect_browser_client(Peer::Api(events), PULL_ORIGIN, API_ADDRESS)
             } else {
                 self.relay.connect_client(Peer::Api(events), API_ORIGIN, API_ADDRESS)
             };
@@ -292,25 +328,35 @@ impl Session {
         let Ok(frame) = serde_json::from_str::<Inbound<'_>>(text) else { return };
         match frame.kind.as_deref() {
             Some("hello") => {
-                let capabilities = frame
+                let capabilities: Vec<String> = frame
                     .capabilities
                     .and_then(json::elements)
                     .map(|items| items.into_iter().filter_map(json::as_str).map(Cow::into_owned).collect())
                     .unwrap_or_default();
+                let profiles = capabilities.iter().any(|capability| capability == PROFILES_CAPABILITY);
                 self.lock().capabilities = capabilities;
                 if let (Some(news), Some(snapshot)) = (&self.news, frame.snapshot) {
-                    let _ = news.send(HostNews::Snapshot(snapshot.to_owned()));
+                    if profiles {
+                        self.opt_in(snapshot);
+                    } else {
+                        let _ = news.send(HostNews::Snapshot(snapshot.to_owned()));
+                    }
                 }
                 self.hello.send_replace(true);
             }
             Some("storage") => {
-                if let (Some(news), Some(changes)) = (&self.news, frame.changes) {
+                if let (Some(news), Some(changes)) = (&self.news, frame.changes)
+                    && self.lock().opting.is_none()
+                {
                     let _ = news.send(HostNews::Storage(changes.to_owned()));
                 }
             }
             Some("reply") => {
                 let Some(id) = frame.id.and_then(json::as_str) else { return };
                 let response = frame.response.unwrap_or(RawValue::NULL);
+                if self.news.is_some() && id == OPT_IN_ID {
+                    return self.opted_in(response);
+                }
                 let mut state = self.lock();
                 let Some(waiter) = state.pending.get_mut(id.as_ref()) else { return };
                 if let Some(reply) = waiter.reply.take() {
@@ -331,6 +377,36 @@ impl Session {
                 self.lost(message.trim_end_matches([':', ' ']), true);
             }
             _ => {}
+        }
+    }
+
+    /// A pulling session's opt-in, on a host that offers profiles: what it
+    /// mirrors waits for the reply.
+    fn opt_in(&self, hello: &RawValue) {
+        self.lock().opting = Some(hello.to_owned());
+        let message =
+            serde_json::json!({ "target": "hoshidicts-worker", "type": OPT_IN, "requestId": OPT_IN_ID, "languages": self.languages });
+        let _ = self.message(&serde_json::json!({ "kind": "request", "id": OPT_IN_ID, "message": message }));
+    }
+
+    /// The opt-in's reply: the records as stored when accepted, their Japanese view
+    /// when the relay lacks a pack the host holds, or the hello's when it failed.
+    fn opted_in(&self, response: &RawValue) {
+        let Some(hello) = self.lock().opting.take() else { return };
+        let reply: Map<String, Value> = serde_json::from_str(response.get()).unwrap_or_default();
+        let snapshot = if let Some(snapshot) = reply.get("snapshot").filter(|snapshot| snapshot.is_object()) {
+            if reply.get("optIn").and_then(Value::as_str) != Some("accepted") {
+                let missing = reply.get("missingLanguages").cloned().unwrap_or(Value::Null);
+                tracing::warn!(%missing, "the browser host holds languages the relay has no pack for; mirroring its Japanese records");
+            }
+            RawValue::from_string(snapshot.to_string()).unwrap_or(hello)
+        } else {
+            let error = reply.get("error").map(Value::to_string).unwrap_or_default();
+            tracing::warn!(%error, "the browser host refused the relay's language opt-in");
+            hello
+        };
+        if let Some(news) = &self.news {
+            let _ = news.send(HostNews::Snapshot(snapshot));
         }
     }
 
@@ -449,7 +525,10 @@ mod tests {
         use crate::ws::frame::TEXT;
         use crate::ws::peer::{Outgoing, SocketPeer};
 
-        const LOOKUP: Duration = Duration::from_millis(300);
+        // The lookup timeout where the test host answers: long enough that a loaded CI
+        // runner never trips it. Tests of the timeout itself pass a short one.
+        const LOOKUP: Duration = Duration::from_secs(10);
+        const NEVER_ANSWERED: Duration = Duration::from_millis(300);
         const WAIT: Duration = Duration::from_secs(5);
 
         struct Host {
@@ -596,7 +675,7 @@ mod tests {
         #[tokio::test]
         async fn hello_that_never_comes_is_504_and_closes_the_session() {
             let mut host = Host::new();
-            let session = Session::new(host.relay.clone(), "0.0.4", LOOKUP);
+            let session = Session::new(host.relay.clone(), "0.0.4", NEVER_ANSWERED);
             assert_eq!(session.ready().await.err(), Some(ApiError::timeout()));
             assert!(!session.alive());
             host.until_client_close().await;
@@ -606,9 +685,9 @@ mod tests {
         async fn replies_are_correlated_by_id_even_out_of_order() {
             let mut host = Host::new();
             let (session, client) = ready(&mut host).await;
-            let first = request(&session, "hd_api_version", json!({}), LOOKUP * 10);
+            let first = request(&session, "hd_api_version", json!({}), LOOKUP);
             let first_id = host.said().await["id"].clone();
-            let second = request(&session, "hd_api_term_entries", json!({ "terms": ["a"] }), LOOKUP * 10);
+            let second = request(&session, "hd_api_term_entries", json!({ "terms": ["a"] }), LOOKUP);
             let frame = host.said().await;
             assert_ne!(frame["id"], first_id);
             assert_eq!(frame["message"], json!({ "target": TARGET, "type": "hd_api_term_entries", "terms": ["a"] }));

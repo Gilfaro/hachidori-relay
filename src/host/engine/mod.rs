@@ -8,11 +8,13 @@
 //! when the generation counter moves on, as the extension's does on publish.
 
 mod ffi;
+mod frequency;
 mod import;
-mod mutations;
+pub(crate) mod languages;
+pub(crate) mod mutations;
 pub(crate) mod package;
 mod remote;
-pub(crate) use remote::IMPORT_IN_PROGRESS;
+pub(crate) use remote::{IMPORT_IN_PROGRESS, Progress};
 
 pub(crate) use mutations::MUTATIONS;
 
@@ -27,6 +29,9 @@ use serde_json::{Map, Value, json};
 
 use self::ffi::{Kind, Native};
 use super::lookup::{furigana, tags};
+use super::profile::JAPANESE;
+use super::registry;
+use super::settings::{custom, profile_worker, profiles, worker};
 use super::store::{self, Store};
 
 /// The extension's `CUSTOM_DICTIONARY_TITLE`.
@@ -92,6 +97,10 @@ struct Loaded {
     last_load_path: Option<&'static str>,
     error: Option<String>,
     banks: Option<(u64, HashMap<String, tags::Bank>)>,
+    /// Whether the records loaded have language profiles (`profileRecords`).
+    profile_records: bool,
+    /// The packs that did not load (`languageFailures`); their lookups fail.
+    language_failures: Vec<Value>,
 }
 
 /// The relay's engine service.
@@ -154,12 +163,12 @@ impl Engine {
         self.ensure_loaded(native, loaded)?;
         match kind {
             "hd_lookup" => {
-                let (text, max, scan, options) = lookup_arguments(message)?;
+                let (text, max, scan, options) = lookup_arguments(message, loaded)?;
                 let json = native.lookup(text, max, scan, &options).map_err(|error| format!("hdw_lookup: {error}"))?;
                 post_process(&json, "hdw_lookup", message, native, loaded)
             }
             "hd_lookup_dictionary" => {
-                let (text, max, scan, options) = lookup_arguments(message)?;
+                let (text, max, scan, options) = lookup_arguments(message, loaded)?;
                 let title = self::text(message.get("dictionary"));
                 let Some(package) = loaded.packages.iter().find(|entry| entry.title == title && entry.kinds.contains(&"term")) else {
                     return Ok(object(json!({"results": [], "dictionaryCount": loaded.dictionary_count})));
@@ -175,7 +184,13 @@ impl Engine {
                 if character.is_empty() {
                     return Ok(object(json!({"kanji": null})));
                 }
-                let json = native.kanji(character).map_err(|error| format!("hdw_kanji: {error}"))?;
+                // A character lookup of a profile reads only its dictionaries.
+                let json = match language_lookup_options(message, loaded)? {
+                    None => native.kanji(character).map_err(|error| format!("hdw_kanji: {error}"))?,
+                    Some(options) => native
+                        .kanji_with_options(character, &Value::Object(options).to_string())
+                        .map_err(|error| format!("hdw_kanji_with_options: {error}"))?,
+                };
                 let kanji = parse_json(&json, "hdw_kanji")?;
                 let character = kanji.get("character").and_then(Value::as_str);
                 if character.is_none() || !kanji.get("entries").is_some_and(Value::is_array) {
@@ -200,7 +215,11 @@ impl Engine {
     /// all of them. Every chunk is checked before the first turn.
     fn segment(&self, message: &Value) -> Reply {
         let scan = clamp_int(message.get("scanLength"), 1, 64, DEFAULT_SCAN_LENGTH);
-        let extra = personal_dictionary_off(message).then_some(("excludedDictionary", CUSTOM_DICTIONARY_TITLE));
+        let mut extra = Map::new();
+        if personal_dictionary_off(message) {
+            extra.insert("excludedDictionary".to_owned(), Value::from(personal_title(message)));
+        }
+        extra.extend(language_lookup_options(message, &self.lock())?.unwrap_or_default());
         let options = lookup_options(message.get("options"), extra)?;
         let chunks = message.get("chunks").and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default();
         let mut checked = Vec::with_capacity(chunks.len());
@@ -248,8 +267,17 @@ impl Engine {
 
     /// Loads `state` and makes it what is loaded, a new generation when `publish`.
     fn reload(&self, native: &mut Native, loaded: &mut Loaded, state: Value, publish: bool) -> Result<(), Failure> {
-        let dictionaries = state.get("dictionaries").and_then(Value::as_array).map_or(&[][..], Vec::as_slice);
-        match self.load(native, dictionaries, None) {
+        // Packs load before the dictionaries publish, so no lookup runs without
+        // its language (`reconcile`).
+        loaded.profile_records = profiles::has_dictionary_profiles(Some(&state));
+        loaded.language_failures = if loaded.profile_records {
+            let languages = profile_worker::distinct_languages(self.store.get(worker::OPTIONS_KEY).as_ref());
+            load_language_packs(native, &languages)
+        } else {
+            Vec::new()
+        };
+        let dictionaries = engine_dictionaries(&state);
+        match self.load(native, &dictionaries, None) {
             Ok(candidate) => {
                 self.install(native, loaded, candidate, state, publish);
                 Ok(())
@@ -272,6 +300,7 @@ impl Engine {
         loaded.packages = packages;
         loaded.dictionary_count = count;
         loaded.failures = failures;
+        loaded.profile_records = profiles::has_dictionary_profiles(Some(&state));
         loaded.state = Some(state);
         loaded.last_load_path = Some("full");
         loaded.error = None;
@@ -481,8 +510,72 @@ fn clamp_int(value: Option<&Value>, min: i32, max: i32, fallback: i32) -> i32 {
     clamped
 }
 
+/// `engineState`'s dictionaries: with profiles, every package of the record,
+/// enabled when a profile enables it (`allPackages`).
+fn engine_dictionaries(state: &Value) -> Vec<Value> {
+    if profiles::has_dictionary_profiles(Some(state)) {
+        return profiles::all_packages(Some(state));
+    }
+    state.get("dictionaries").and_then(Value::as_array).cloned().unwrap_or_default()
+}
+
+/// `loadLanguagePacks(codes, { all: true })`: loads every pack of `languages`
+/// that is not loaded; the ones that fail are reported and the others keep working.
+fn load_language_packs(native: &mut Native, languages: &[String]) -> Vec<Value> {
+    languages
+        .iter()
+        .filter_map(|code| languages::load(native, code).err().map(|error| json!({ "language": code, "error": error })))
+        .collect()
+}
+
+/// `languageLookupOptions`: once the records have profiles, the worker names each
+/// lookup's language, its profile's enabled package ids and its pack settings'
+/// engine effects. The ids map to the directories this engine has loaded. A
+/// request without them is today's: no keys are added.
+fn language_lookup_options(message: &Value, loaded: &Loaded) -> Result<Option<Map<String, Value>>, Failure> {
+    if message.get("language").is_none() {
+        return Ok(None);
+    }
+    let language = text(message.get("language"));
+    if loaded.language_failures.iter().any(|entry| entry["language"] == language) {
+        return Err(format!("{} could not be loaded.", registry::name(language)).into());
+    }
+    let ids = message.get("dictionaries").and_then(Value::as_array).map_or(&[][..], Vec::as_slice);
+    let dictionaries: Vec<Value> = ids
+        .iter()
+        .filter_map(|id| loaded.packages.iter().find(|entry| !entry.id.is_null() && &entry.id == id))
+        .map(|entry| Value::from(entry.dir.as_str()))
+        .collect();
+    let options = message.get("languageOptions").and_then(Value::as_array).map_or(&[][..], Vec::as_slice);
+    Ok(Some(object(json!({
+        "language": language,
+        "dictionaries": dictionaries,
+        "languageOptions": options.iter().filter(|option| option.is_string()).collect::<Vec<_>>(),
+    }))))
+}
+
+/// `personalTitle`: the title of the personal package of the language a request is for.
+fn personal_title(message: &Value) -> String {
+    let language = message.get("language").and_then(Value::as_str).unwrap_or(JAPANESE);
+    custom::identity(language).map_or_else(|| CUSTOM_DICTIONARY_TITLE.to_owned(), |identity| identity.title)
+}
+
+/// `kanaRuby`: the KANJIDIC furigana split runs for packs whose ruby is anchored
+/// on kana, and for requests that name no language.
+fn kana_ruby(message: &Value) -> bool {
+    match message.get("language") {
+        None => true,
+        Some(language) if language == JAPANESE => true,
+        Some(language) => language
+            .as_str()
+            .and_then(registry::get)
+            .and_then(|descriptor| descriptor.pointer("/capabilities/ruby/alignment"))
+            .is_some_and(|alignment| alignment == "kana"),
+    }
+}
+
 /// `lookupOptionsJson`.
-fn lookup_options(options: Option<&Value>, extra: Option<(&str, &str)>) -> Result<String, Failure> {
+fn lookup_options(options: Option<&Value>, extra: Map<String, Value>) -> Result<String, Failure> {
     let field = |name: &str| options.and_then(|options| options.get(name));
     let frequency_order = text(field("frequencyOrder"));
     let mut json = json!({
@@ -491,19 +584,19 @@ fn lookup_options(options: Option<&Value>, extra: Option<(&str, &str)>) -> Resul
         "primaryReading": bounded_text(field("primaryReading"), "primary reading", MAX_LOOKUP_TEXT_BYTES, false)?,
         "metadataOnlyTerms": field("metadataOnlyTerms") == Some(&Value::Bool(true)),
     });
-    if let (Some((key, value)), Some(map)) = (extra, json.as_object_mut()) {
-        map.insert(key.to_owned(), Value::from(value));
+    if let Some(map) = json.as_object_mut() {
+        map.extend(extra);
     }
     Ok(json.to_string())
 }
 
 /// `lookupArguments`.
-fn lookup_arguments(message: &Value) -> Result<(&str, i32, i32, String), Failure> {
+fn lookup_arguments<'a>(message: &'a Value, loaded: &Loaded) -> Result<(&'a str, i32, i32, String), Failure> {
     Ok((
         bounded_text(message.get("text"), "lookup text", MAX_LOOKUP_TEXT_BYTES, true)?,
         clamp_int(message.get("maxResults"), 1, 256, DEFAULT_MAX_RESULTS),
         clamp_int(message.get("scanLength"), 1, 64, DEFAULT_SCAN_LENGTH),
-        lookup_options(message.get("options"), None)?,
+        lookup_options(message.get("options"), language_lookup_options(message, loaded)?.unwrap_or_default())?,
     ))
 }
 
@@ -515,7 +608,25 @@ fn personal_dictionary_off(message: &Value) -> bool {
     message.get("options").and_then(|options| options.get("personalDictionary")) == Some(&Value::Bool(false))
 }
 
-/// `withFurigana(withDefinitionTags(withoutPersonalDictionary(termLookupReply(json))))`.
+/// The term-bank kanji dictionary whose term-meta ranks are characters', not words'.
+const KANJI_RANKS_DICTIONARY: &str = "Bee's Ultimate Kanji Dictionary";
+
+/// `withoutKanjiWordFrequencies` (#724): Bee's rich kanji cards come from term
+/// banks, character ranks included. Those ranks belong to the clicked-kanji
+/// route, not to a word's frequencies or their averages, so a lookup drops each
+/// result's first group from that dictionary (by its canonical title).
+fn without_kanji_word_frequencies(results: &mut [Value]) {
+    for result in results {
+        let Some(groups) = result.pointer_mut("/term/frequencies").and_then(Value::as_array_mut) else { continue };
+        if let Some(index) = groups.iter().position(|group| group.get("dictionary").and_then(Value::as_str) == Some(KANJI_RANKS_DICTIONARY))
+        {
+            groups.remove(index);
+        }
+    }
+}
+
+/// `withFurigana(withDefinitionTags(withoutPersonalDictionary(termLookupReply(json))))`,
+/// and for `hdw_lookup` `withoutKanjiWordFrequencies` first.
 fn post_process(json: &str, source: &str, message: &Value, native: &Native, loaded: &mut Loaded) -> Reply {
     let mut parsed = parse_json(json, source)?;
     let count_ok = parsed.get("dictionaryCount").and_then(Value::as_u64).is_some_and(|count| count <= (1 << 53));
@@ -524,11 +635,15 @@ fn post_process(json: &str, source: &str, message: &Value, native: &Native, load
     }
     let mut reply = object(parsed.take());
     let Some(Value::Array(results)) = reply.get_mut("results") else { return Ok(reply) };
+    if source == "hdw_lookup" {
+        without_kanji_word_frequencies(results);
+    }
     if personal_dictionary_off(message) {
+        let title = personal_title(message);
         results.retain_mut(|result| {
             let Some(glossaries) = result.pointer_mut("/term/glossaries").and_then(Value::as_array_mut) else { return true };
             let before = glossaries.len();
-            glossaries.retain(|glossary| glossary.get("dictionary").and_then(Value::as_str) != Some(CUSTOM_DICTIONARY_TITLE));
+            glossaries.retain(|glossary| glossary.get("dictionary").and_then(Value::as_str) != Some(title.as_str()));
             glossaries.len() == before || !glossaries.is_empty()
         });
     }
@@ -545,7 +660,9 @@ fn post_process(json: &str, source: &str, message: &Value, native: &Native, load
                 glossary.insert("tags".to_owned(), Value::Array(expanded));
             }
         }
-        if let Some(term) = result.get_mut("term").and_then(Value::as_object_mut) {
+        if let Some(term) = result.get_mut("term").and_then(Value::as_object_mut)
+            && kana_ruby(message)
+        {
             let furigana = furigana::furigana(text(term.get("expression")), text(term.get("reading")));
             if let Some(furigana) = furigana {
                 term.insert("furigana".to_owned(), furigana);
@@ -658,7 +775,7 @@ fn kind_of(kind: &str) -> Kind {
 
 /// `hd_status`, for an engine that is native, unthreaded and keeps every package resident.
 fn status(loaded: &Loaded) -> Map<String, Value> {
-    object(json!({
+    let mut status = object(json!({
         "ok": loaded.error.is_none(),
         "error": loaded.error,
         "ready": true,
@@ -678,7 +795,11 @@ fn status(loaded: &Loaded) -> Map<String, Value> {
         "useLessRamByDefault": true,
         "hashIndexStorage": "resident",
         "residentHashBudgetBytes": null,
-    }))
+    }));
+    if loaded.profile_records {
+        status.insert("failedLanguages".to_owned(), Value::from(loaded.language_failures.clone()));
+    }
+    status
 }
 
 fn file_bytes(dir: &str, name: &str) -> u64 {
@@ -740,6 +861,22 @@ mod tests {
         let reply = native.lookup("食べる", 8, 16, "");
         drop(native);
         assert_eq!(reply.as_deref(), Ok(r#"{"results":[],"dictionaryCount":0}"#));
+    }
+
+    /// Upstream's engine-lookup smoke step "character ranks from Bee's term banks
+    /// stay in clicked-kanji lookups" (#724), on a reply's results.
+    #[test]
+    fn a_word_lookup_drops_the_kanji_dictionarys_character_ranks() {
+        let rank = |dictionary: &str, value: u64| json!({ "dictionary": dictionary, "frequencies": [{ "value": value }] });
+        let mut results = vec![
+            json!({ "term": { "expression": "食", "frequencies": [rank(KANJI_RANKS_DICTIONARY, 3), rank("Word ranks", 200)] } }),
+            json!({ "term": { "expression": "食う", "frequencies": [rank("Word ranks", 900)] } }),
+            json!({ "term": { "expression": "x" } }),
+        ];
+        without_kanji_word_frequencies(&mut results);
+        assert_eq!(results[0]["term"]["frequencies"], json!([rank("Word ranks", 200)]));
+        assert_eq!(results[1]["term"]["frequencies"], json!([rank("Word ranks", 900)]));
+        assert_eq!(results[2], json!({ "term": { "expression": "x" } }));
     }
 
     #[test]

@@ -347,6 +347,9 @@ pub(crate) struct Fetched {
     pub(crate) status: u16,
     /// `response.url`: where the redirects ended.
     pub(crate) url: String,
+    /// `declaredResponseLength`: the Content-Length, when the body is not
+    /// content-encoded (a decoded body is not comparable with it).
+    pub(crate) total: Option<u64>,
     pub(crate) body: Box<dyn Read + Send>,
 }
 
@@ -354,6 +357,15 @@ pub(crate) struct Fetched {
 pub(crate) trait Fetch: Send + Sync {
     /// `idle` bounds the wait for the response's headers and each read of its body.
     fn get(&self, url: &str, idle: Option<Duration>) -> Result<Fetched, String>;
+}
+
+/// Whether a body read failed because the response went quiet for its idle time.
+pub(crate) fn read_timed_out(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::TimedOut
+        || error
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<ureq::Error>())
+            .is_some_and(|inner| matches!(inner, ureq::Error::Timeout(_)))
 }
 
 /// The network.
@@ -367,21 +379,29 @@ pub(crate) const TIMED_OUT: &str = "timed out";
 impl Fetch for Http {
     fn get(&self, url: &str, idle: Option<Duration>) -> Result<Fetched, String> {
         use ureq::ResponseExt;
-        let agent: ureq::Agent = ureq::Agent::config_builder()
-            .max_redirects(20)
-            .http_status_as_error(false)
-            .timeout_connect(Some(Duration::from_secs(30)))
-            .timeout_recv_response(idle)
-            .timeout_recv_body(idle)
-            .build()
-            .into();
+        let agent = crate::host::loopback::agent(
+            ureq::Agent::config_builder()
+                .max_redirects(20)
+                .http_status_as_error(false)
+                .timeout_connect(Some(Duration::from_secs(30)))
+                .timeout_recv_response(idle)
+                // Each read renews the wait, with no total deadline: the extension
+                // restarts its inactivity timer on every chunk of the body.
+                .timeout_per_read(idle)
+                .build(),
+        );
         let response = agent.get(url).call().map_err(|error| {
             tracing::debug!(%error, %url, "a dictionary download failed");
             if matches!(error, ureq::Error::Timeout(_)) { TIMED_OUT } else { FAILED_TO_FETCH }.to_owned()
         })?;
+        let header = |name: &str| response.headers().get(name).and_then(|value| value.to_str().ok()).map(str::to_owned);
+        let identity =
+            header("content-encoding").is_none_or(|encoding| encoding.is_empty() || encoding.trim().eq_ignore_ascii_case("identity"));
+        let total = header("content-length").and_then(|length| length.trim().parse::<u64>().ok()).filter(|length| identity && *length > 0);
         Ok(Fetched {
             status: response.status().as_u16(),
             url: response.get_uri().to_string(),
+            total,
             body: Box::new(response.into_body().into_reader()),
         })
     }
@@ -389,7 +409,54 @@ impl Fetch for Http {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write as _;
+
     use super::*;
+
+    /// A loopback server answering once: headers, then `chunks` of body each
+    /// after `gap`, then (if `stall`) silence instead of the end.
+    fn trickle(chunks: usize, gap: Duration, stall: bool) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/index.json", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = [0u8; 4096];
+            let _ = Read::read(&mut socket, &mut request);
+            let length = if stall { chunks + 1 } else { chunks };
+            let _ = write!(
+                socket,
+                "HTTP/1.1 200 OK
+content-length: {length}
+connection: close
+
+"
+            );
+            for _ in 0..chunks {
+                std::thread::sleep(gap);
+                let _ = socket.write_all(b"x");
+                let _ = socket.flush();
+            }
+            if stall {
+                std::thread::sleep(gap * 20);
+            }
+        });
+        url
+    }
+
+    // The extension's update-check timeout: slow chunks renew the inactivity
+    // wait with no total deadline, and silence for the whole wait fails.
+    #[test]
+    fn a_slow_body_renews_its_idle_wait_and_silence_times_out() {
+        let idle = Some(Duration::from_millis(400));
+        let mut body = Vec::new();
+        let fetched = Http.get(&trickle(8, Duration::from_millis(150), false), idle).unwrap();
+        assert_eq!(fetched.total, Some(8), "the declared length of an unencoded body");
+        fetched.body.take(64).read_to_end(&mut body).unwrap();
+        assert_eq!(body, b"xxxxxxxx", "1.2 s of body in 150 ms chunks is within a 400 ms idle wait");
+        let fetched = Http.get(&trickle(1, Duration::from_millis(100), true), idle).unwrap();
+        let error = fetched.body.take(64).read_to_end(&mut Vec::new()).unwrap_err();
+        assert!(read_timed_out(&error), "{error:?}");
+    }
 
     #[test]
     fn recommended_downloads_may_end_at_their_release_assets() {
@@ -461,6 +528,80 @@ mod tests {
             update_settings(Some(&json!({ "revision": -1, "schedule": "yearly" }))),
             json!({ "revision": 0, "schedule": "off", "lastCheckedAt": null })
         );
+    }
+
+    /// Upstream's dictionary-update-schedule.test.mjs at bf1a78f, with its values.
+    mod upstream_schedules {
+        use super::*;
+
+        const HOUR: f64 = 3_600_000.0;
+
+        fn now() -> f64 {
+            parse_time("2026-09-07T12:00:00Z").unwrap()
+        }
+
+        fn managed(patch: Value) -> Value {
+            let Value::Object(patch) = patch else { panic!("a patch is an object") };
+            let mut dictionary = json!({ "isUpdatable": true, "indexUrl": "https://example.com/index.json",
+                "downloadUrl": "https://example.com/dictionary.zip" });
+            for (key, value) in patch {
+                dictionary[key] = value;
+            }
+            dictionary
+        }
+
+        fn at(offset: f64) -> String {
+            js::iso_time(now() + offset).unwrap()
+        }
+
+        #[test]
+        fn explicit_policies_override_the_global_schedule() {
+            let now = now();
+            assert_eq!(next_check(&managed(json!({})), "daily", now), Some(now));
+            assert_eq!(next_check(&managed(json!({ "updateScheduleOverride": null })), "weekly", now), Some(now));
+            let checked = json!({ "lastUpdateCheck": { "checkedAt": at(0.0) } });
+            let hourly = managed(json!({ "updateScheduleOverride": "hourly", "lastUpdateCheck": checked["lastUpdateCheck"] }));
+            assert_eq!(next_check(&hourly, "off", now), Some(now + HOUR), "hourly overrides global Off");
+            let weekly = managed(json!({ "updateScheduleOverride": null, "lastUpdateCheck": checked["lastUpdateCheck"] }));
+            assert_eq!(next_check(&weekly, "weekly", now), Some(now + 168.0 * HOUR), "null inherits");
+            assert_eq!(next_check(&managed(json!({ "updateScheduleOverride": "off" })), "hourly", now), None);
+            assert_eq!(next_check(&json!({ "isUpdatable": false }), "hourly", now), None);
+        }
+
+        #[test]
+        fn due_times_include_disabled_packages_and_advance_after_any_attempt() {
+            let now = now();
+            for (schedule, hours) in [("hourly", 1.0), ("daily", 24.0), ("weekly", 168.0), ("monthly", 720.0)] {
+                for status in ["up-to-date", "check-failed", "update-available"] {
+                    let dictionary = managed(json!({ "enabled": false, "updateScheduleOverride": schedule,
+                        "lastUpdateCheck": { "checkedAt": at(-HOUR), "status": status } }));
+                    assert_eq!(next_check(&dictionary, "off", now), Some(now + (hours - 1.0) * HOUR), "{schedule} {status}");
+                }
+            }
+            for checked_at in [None, Some(json!(null)), Some(json!("invalid"))] {
+                let check = checked_at.map_or_else(|| json!({}), |checked_at| json!({ "checkedAt": checked_at }));
+                assert_eq!(next_check(&managed(json!({ "lastUpdateCheck": check })), "daily", now), Some(now));
+            }
+        }
+
+        #[test]
+        fn one_aggregate_due_time_selects_only_managed_active_schedules() {
+            let now = now();
+            let checked = json!({ "checkedAt": at(0.0) });
+            assert_eq!(next_managed_check(&[], "hourly", now), None);
+            assert_eq!(next_managed_check(&[managed(json!({ "updateScheduleOverride": "off" }))], "daily", now), None);
+            let dictionaries = vec![
+                managed(json!({ "lastUpdateCheck": checked })),
+                managed(json!({ "enabled": false, "updateScheduleOverride": "hourly", "lastUpdateCheck": checked })),
+                json!({ "isUpdatable": false }),
+            ];
+            assert_eq!(next_managed_check(&dictionaries, "daily", now), Some(now + HOUR));
+            assert_eq!(next_managed_check(&dictionaries, "off", now), Some(now + HOUR));
+            let unchecked = [dictionaries, vec![managed(json!({}))]].concat();
+            assert_eq!(next_managed_check(&unchecked, "daily", now), Some(now));
+            let overdue = managed(json!({ "lastUpdateCheck": { "checkedAt": at(-48.0 * HOUR) } }));
+            assert_eq!(next_managed_check(&[overdue], "daily", now), Some(now));
+        }
     }
 
     #[test]

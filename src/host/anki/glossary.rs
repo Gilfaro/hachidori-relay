@@ -10,8 +10,9 @@ use serde_json::{Map, Value};
 
 use super::compact;
 use super::css::{self, Selector};
-use super::dom::{Element, Node, escape_text};
+use super::dom::{Element, Node, deep, escape_text};
 use super::gateway::{Failure, Result};
+use super::language::{NoteLanguage, has_rtl_text, language_from_text, mark_block_directions};
 use crate::host::js;
 
 const MAX_STRUCTURED_NODES: usize = 1_048_576;
@@ -22,8 +23,6 @@ const MAX_DATA_VALUE_LENGTH: usize = 4096;
 const MAX_LOOKUP_TEXT_BYTES: usize = 4 * 1024;
 const MAX_DICTIONARY_STYLE_BYTES: usize = 256 * 1024;
 const MAX_DICTIONARY_STYLES_BYTES: usize = 2 * 1024 * 1024;
-/// How deeply structured content may nest here (the extension walks it without recursion).
-const MAX_DEPTH: usize = 4096;
 
 const ALLOWED_TAGS: [&str; 27] = [
     "a", "br", "code", "details", "div", "em", "img", "li", "ol", "p", "rp", "rt", "ruby", "small", "span", "strong", "sub", "summary",
@@ -64,29 +63,6 @@ const STYLE_PROPERTIES: [(&str, &str); 32] = [
     ("cursor", "cursor"),
     ("listStyleType", "list-style-type"),
 ];
-
-/// `JAPANESE_TEXT_PATTERN`.
-fn is_japanese(c: char) -> bool {
-    matches!(c, '\u{3000}'..='\u{30ff}' | '\u{3400}'..='\u{4dbf}' | '\u{4e00}'..='\u{9fff}' | '\u{f900}'..='\u{faff}'
-        | '\u{ff01}'..='\u{ff1f}' | '\u{ff21}'..='\u{ff3f}' | '\u{ff41}'..='\u{ff9f}' | '\u{ffe0}'..='\u{ffee}'
-        | '\u{20000}'..='\u{2a6df}' | '\u{2a700}'..='\u{2ee5f}' | '\u{2f800}'..='\u{2fa1f}' | '\u{30000}'..='\u{323af}')
-}
-
-/// `CHINESE_TEXT_PATTERN`.
-fn is_chinese(c: char) -> bool {
-    matches!(c, '\u{3100}'..='\u{312f}' | '\u{31a0}'..='\u{31bf}' | '\u{fe10}'..='\u{fe1f}' | '\u{fe50}'..='\u{fe6f}' | '\u{16fe0}'..='\u{16fff}')
-}
-
-/// `languageFromText`.
-fn language_from_text(text: &str) -> Option<&'static str> {
-    if text.chars().any(is_japanese) {
-        Some("ja")
-    } else if text.chars().any(is_chinese) {
-        Some("zh")
-    } else {
-        None
-    }
-}
 
 fn is_record(value: &Value) -> bool {
     value.is_object()
@@ -306,6 +282,15 @@ struct State<'a, 'b> {
     /// `appendImage`: `None` leaves images out (plain text).
     images: Option<&'a mut FilenameFor<'b>>,
     path: Vec<Segment>,
+    /// Compact popup and Anki: a row's glossaries share one line.
+    compact_glossaries: bool,
+    /// The language of the profile the note is mined in, which detects each
+    /// string's language (10.3) in place of today's test.
+    note: Option<&'a NoteLanguage>,
+    /// The dictionary's target language, which the body carries.
+    block_language: Option<String>,
+    /// The nearest `lang` above the element text is appended to.
+    above: Option<String>,
 }
 
 impl State<'_, '_> {
@@ -372,74 +357,87 @@ fn append_image(parent: &mut Element, value: &Map<String, Value>, path: &str, st
 
 /// `appendStructuredValue`, for the Anki layout. `language` is the nearest
 /// dictionary-set `lang`.
-fn append_value(parent: &mut Element, value: &Value, state: &mut State<'_, '_>, language: Option<&str>, depth: usize) -> Result<()> {
-    if depth > MAX_DEPTH {
-        return Err(Failure::new(format!("Structured content nesting exceeds limit {MAX_DEPTH} at {}", location(&state.path))));
-    }
-    state.count()?;
-    let child = |parent: &mut Element, value: &Value, segment: Segment, state: &mut State<'_, '_>, language: Option<&str>| {
-        state.path.push(segment);
-        let result = append_value(parent, value, state, language, depth + 1);
-        state.path.pop();
-        result
-    };
-    match value {
-        Value::String(text) => {
-            parent.append_text(text);
-            if language.is_none()
-                && let Some(detected) = language_from_text(text)
-            {
-                parent.set_attribute("lang", detected);
-            }
-            Ok(())
-        }
-        Value::Number(_) | Value::Bool(_) => {
-            parent.append_text(&js::to_string(Some(value)));
-            Ok(())
-        }
-        Value::Array(items) => {
-            for (index, item) in items.iter().enumerate() {
-                child(parent, item, Segment::Index(index), state, language)?;
-            }
-            Ok(())
-        }
-        Value::Null => Ok(()),
-        Value::Object(record) => {
-            let kind = record.get("type").and_then(Value::as_str);
-            if kind == Some("structured-content") {
-                return match record.get("content") {
-                    Some(content) => child(parent, content, Segment::Key("content"), state, language),
-                    None => child(parent, &Value::Null, Segment::Key("content"), state, language).map(drop),
-                };
-            }
-            if kind == Some("text") {
-                let property = if record.contains_key("text") { "text" } else { "content" };
-                let content = record.get(property).unwrap_or(&Value::Null);
-                return child(parent, content, Segment::Key(if property == "text" { "text" } else { "content" }), state, language);
-            }
-            let tag = if kind == Some("image") {
-                "img".to_owned()
-            } else {
-                record.get("tag").and_then(Value::as_str).map(str::to_lowercase).unwrap_or_default()
-            };
-            if IGNORED_TAGS.contains(&tag.as_str()) {
-                return Ok(());
-            }
-            if !ALLOWED_TAGS.contains(&tag.as_str()) {
-                if let Some(content) = record.get("content") {
-                    return child(parent, content, Segment::Key("content"), state, language);
+fn append_value(parent: &mut Element, value: &Value, state: &mut State<'_, '_>, language: Option<&str>) -> Result<()> {
+    deep(|| {
+        state.count()?;
+        let child = |parent: &mut Element, value: &Value, segment: Segment, state: &mut State<'_, '_>, language: Option<&str>| {
+            state.path.push(segment);
+            let result = append_value(parent, value, state, language);
+            state.path.pop();
+            result
+        };
+        match value {
+            Value::String(text) => {
+                parent.append_text(text);
+                if language.is_none() {
+                    let detected = match state.note {
+                        // A label only where the language differs from the one
+                        // the text inherits: from a block above it inside the
+                        // glossary, else the dictionary's default.
+                        Some(note) => note.detect_glossary(text, &state.dictionary).filter(|detected| {
+                            let inherited = parent
+                                .attribute("lang")
+                                .map(str::to_owned)
+                                .or_else(|| state.above.clone())
+                                .or_else(|| state.block_language.clone());
+                            inherited.as_ref() != Some(detected)
+                        }),
+                        None => language_from_text(text).map(str::to_owned),
+                    };
+                    if let Some(detected) = detected {
+                        parent.set_attribute("lang", &detected);
+                    }
                 }
-                return Ok(());
+                Ok(())
             }
-            if tag == "img" {
-                return match media_path(record.get("path")) {
-                    Some(path) => append_image(parent, record, path, state),
-                    None => Ok(()),
+            Value::Number(_) | Value::Bool(_) => {
+                parent.append_text(&js::to_string(Some(value)));
+                Ok(())
+            }
+            Value::Array(items) => {
+                for (index, item) in items.iter().enumerate() {
+                    child(parent, item, Segment::Index(index), state, language)?;
+                }
+                Ok(())
+            }
+            Value::Null => Ok(()),
+            Value::Object(record) => {
+                let kind = record.get("type").and_then(Value::as_str);
+                if kind == Some("structured-content") {
+                    return match record.get("content") {
+                        Some(content) => child(parent, content, Segment::Key("content"), state, language),
+                        None => child(parent, &Value::Null, Segment::Key("content"), state, language).map(drop),
+                    };
+                }
+                if kind == Some("text") {
+                    let property = if record.contains_key("text") { "text" } else { "content" };
+                    let content = record.get(property).unwrap_or(&Value::Null);
+                    return child(parent, content, Segment::Key(if property == "text" { "text" } else { "content" }), state, language);
+                }
+                let tag = if kind == Some("image") {
+                    "img".to_owned()
+                } else {
+                    record.get("tag").and_then(Value::as_str).map(str::to_lowercase).unwrap_or_default()
                 };
+                if IGNORED_TAGS.contains(&tag.as_str()) {
+                    return Ok(());
+                }
+                if !ALLOWED_TAGS.contains(&tag.as_str()) {
+                    if let Some(content) = record.get("content") {
+                        return child(parent, content, Segment::Key("content"), state, language);
+                    }
+                    return Ok(());
+                }
+                if tag == "img" {
+                    return match media_path(record.get("path")) {
+                        Some(path) => append_image(parent, record, path, state),
+                        None => Ok(()),
+                    };
+                }
+                append_element(parent, record, &tag, state, language)
             }
-            append_element(parent, record, &tag, state, language, depth)
         }
-    }
+    })
 }
 
 fn append_element(
@@ -448,7 +446,6 @@ fn append_element(
     tag: &str,
     state: &mut State<'_, '_>,
     language: Option<&str>,
-    depth: usize,
 ) -> Result<()> {
     let mut element = Element::new(tag);
     element.add_class(&format!("gloss-sc-{tag}"));
@@ -501,23 +498,26 @@ fn append_element(
             None => {}
         }
     }
+    let above = state.above.clone();
+    state.above = parent.attribute("lang").map(str::to_owned).or_else(|| above.clone());
     if tag != "br"
         && let Some(content) = record.get("content")
     {
         state.path.push(Segment::Key("content"));
         let result = if tag == "a" {
             let mut text = Element::with_class("span", "gloss-link-text");
-            let result = append_value(&mut text, content, state, language.as_deref(), depth + 1);
+            let result = append_value(&mut text, content, state, language.as_deref());
             element.append(text);
             result
         } else {
-            append_value(&mut element, content, state, language.as_deref(), depth + 1)
+            append_value(&mut element, content, state, language.as_deref())
         };
         state.path.pop();
         result?;
     } else if tag == "a" {
         element.append(Element::with_class("span", "gloss-link-text"));
     }
+    state.above = above;
     if external {
         let mut icon = Element::with_class("span", "gloss-link-external-icon icon");
         icon.set_data("icon", "external-link");
@@ -534,16 +534,80 @@ fn append_element(
     Ok(())
 }
 
+/// Yomitan's `anki-compact-gloss-style.js` (67db60d) under Compact popup and
+/// Anki, scoped to the glossary as its `addGlossaryScopeToCss` scopes it: a
+/// structured `ul[data-sc-content="glossary"]` shares one line, its items
+/// separated by a grey bar.
+const COMPACT_GLOSS_STYLES: &str = ".yomitan-glossary ul[data-sc-content=\"glossary\"] > li:not(:first-child)::before {
+  white-space: pre-wrap;
+  content: ' | ';
+  display: inline;
+  color: #777777;
+}
+.yomitan-glossary ul[data-sc-content=\"glossary\"] > li {
+  display: inline;
+}
+.yomitan-glossary ul[data-sc-content=\"glossary\"] {
+  display: inline;
+  list-style: none;
+  padding-left: 0;
+}";
+
+/// How definitions are laid out: Smaller Anki cards (`compact`) and Design →
+/// Compact glossaries → Compact popup and Anki (`compact_glossaries`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Layout {
+    pub(crate) compact: bool,
+    pub(crate) compact_glossaries: bool,
+}
+
+impl Layout {
+    /// A Template configuration's layout, as `read_config` records it.
+    pub(crate) fn of(config: &Map<String, Value>) -> Self {
+        Self {
+            compact: config.get("compactGlossary") == Some(&Value::Bool(true)),
+            compact_glossaries: config.get("compactGlossaries") == Some(&Value::Bool(true)),
+        }
+    }
+}
+
+/// `JSON.parse` for a glossary: no nesting limit, as the extension has none.
+fn parse_deep(text: &str) -> Option<Value> {
+    use serde::Deserialize;
+    let mut json = serde_json::Deserializer::from_str(text);
+    json.disable_recursion_limit();
+    let value = Value::deserialize(serde_stacker::Deserializer::new(&mut json)).ok()?;
+    json.end().ok()?;
+    Some(value)
+}
+
+/// A parsed glossary, dropped without recursing (`serde_json`'s drop follows the
+/// nesting).
+struct Deep(Value);
+
+impl Drop for Deep {
+    fn drop(&mut self) {
+        let mut stack = vec![self.0.take()];
+        while let Some(value) = stack.pop() {
+            match value {
+                Value::Array(items) => stack.extend(items),
+                Value::Object(record) => stack.extend(record.into_iter().map(|(_, value)| value)),
+                _ => {}
+            }
+        }
+    }
+}
+
 /// `appendTextOnlyGlossary` with `layout: "anki"`.
 fn append_glossary(parent: &mut Element, raw: Option<&Value>, state: &mut State<'_, '_>) -> Result<()> {
     let text = raw.and_then(Value::as_str).unwrap_or_default();
     if text.is_empty() {
         return Ok(());
     }
-    let parsed: Value = serde_json::from_str(text).unwrap_or_else(|_| Value::String(text.to_owned()));
-    let items = match parsed {
-        Value::Array(items) => items,
-        other => vec![other],
+    let parsed = Deep(parse_deep(text).unwrap_or_else(|| Value::String(text.to_owned())));
+    let items = match &parsed.0 {
+        Value::Array(items) => items.as_slice(),
+        other => std::slice::from_ref(other),
     };
     if items.is_empty() {
         return Ok(());
@@ -551,15 +615,25 @@ fn append_glossary(parent: &mut Element, raw: Option<&Value>, state: &mut State<
     if items.iter().any(|item| item.get("type").and_then(Value::as_str) == Some("structured-content") && is_record(item)) {
         parent.add_class("structured-content");
     }
-    state.path = vec![Segment::Key("glossary"), Segment::Index(0)];
-    if let [item] = items.as_slice() {
-        return append_value(parent, item, state, None, 0);
+    // Yomitan's Anki glossary-single template emits one element bare and
+    // several as a list, or joined by " | " under Compact popup and Anki.
+    if items.len() == 1 || state.compact_glossaries {
+        state.above = None;
+        for (index, item) in items.iter().enumerate() {
+            if index > 0 {
+                parent.append_text(" | ");
+            }
+            state.path = vec![Segment::Key("glossary"), Segment::Index(index)];
+            append_value(parent, item, state, None)?;
+        }
+        return Ok(());
     }
     let mut list = Element::with_class("ul", "gloss-list");
+    state.above = parent.attribute("lang").map(str::to_owned);
     for (index, item) in items.iter().enumerate() {
         state.path = vec![Segment::Key("glossary"), Segment::Index(index)];
         let mut entry = Element::with_class("li", "gloss-item");
-        append_value(&mut entry, item, state, None, 0)?;
+        append_value(&mut entry, item, state, None)?;
         list.append(entry);
     }
     parent.append(list);
@@ -625,27 +699,29 @@ fn might_match(rule: &ClassRule, classes: &[&str]) -> bool {
 /// The elements of `root` with a class, by child-index path, and the style
 /// `applyClassStyles` writes on each: matching rules first, then its own.
 fn class_styles<'a>(element: &'a Element, ancestors: &mut Vec<&'a Element>, path: &mut Vec<usize>, out: &mut Vec<(Vec<usize>, String)>) {
-    ancestors.push(element);
-    for (index, child) in element.children.iter().enumerate() {
-        let Node::Element(child) = child else { continue };
-        path.push(index);
-        if child.has_attribute("class") {
-            let classes = child.classes();
-            let mut css_text = String::new();
-            for rule in class_rules() {
-                if might_match(rule, &classes) && rule.selectors.iter().any(|selector| css::matches(selector, ancestors, child)) {
-                    css_text.push_str(&rule.css_text);
+    deep(|| {
+        ancestors.push(element);
+        for (index, child) in element.children.iter().enumerate() {
+            let Node::Element(child) = child else { continue };
+            path.push(index);
+            if child.has_attribute("class") {
+                let classes = child.classes();
+                let mut css_text = String::new();
+                for rule in class_rules() {
+                    if might_match(rule, &classes) && rule.selectors.iter().any(|selector| css::matches(selector, ancestors, child)) {
+                        css_text.push_str(&rule.css_text);
+                    }
+                }
+                if !css_text.is_empty() {
+                    css_text.push_str(&child.css_text());
+                    out.push((path.clone(), css_text));
                 }
             }
-            if !css_text.is_empty() {
-                css_text.push_str(&child.css_text());
-                out.push((path.clone(), css_text));
-            }
+            class_styles(child, ancestors, path, out);
+            path.pop();
         }
-        class_styles(child, ancestors, path, out);
-        path.pop();
-    }
-    ancestors.pop();
+        ancestors.pop();
+    });
 }
 
 fn element_at<'a>(root: &'a mut Element, path: &[usize]) -> Option<&'a mut Element> {
@@ -681,7 +757,7 @@ const BLOCKS: [&str; 13] = ["br", "div", "li", "ol", "p", "table", "tbody", "td"
 
 /// `plainText`.
 fn plain_text(node: &Node, out: &mut String) {
-    match node {
+    deep(|| match node {
         Node::Text(text) => out.push_str(text),
         Node::Raw(_) => {}
         Node::Element(element) => {
@@ -695,7 +771,7 @@ fn plain_text(node: &Node, out: &mut String) {
                 out.push('\n');
             }
         }
-    }
+    });
 }
 
 /// `/\r?\n|\r/u` lines.
@@ -725,24 +801,26 @@ fn lines(text: &str) -> Vec<&str> {
 
 /// `replaceNewlines`: each line break of the text becomes a `<br>`.
 fn replace_newlines(element: &mut Element) {
-    let children = std::mem::take(&mut element.children);
-    for child in children {
-        match child {
-            Node::Text(text) => {
-                for (index, line) in lines(&text).into_iter().enumerate() {
-                    if index > 0 {
-                        element.append(Element::new("br"));
+    deep(|| {
+        let children = std::mem::take(&mut element.children);
+        for child in children {
+            match child {
+                Node::Text(text) => {
+                    for (index, line) in lines(&text).into_iter().enumerate() {
+                        if index > 0 {
+                            element.append(Element::new("br"));
+                        }
+                        element.children.push(Node::text(line));
                     }
-                    element.children.push(Node::text(line));
                 }
+                Node::Element(mut inner) => {
+                    replace_newlines(&mut inner);
+                    element.children.push(Node::Element(inner));
+                }
+                raw @ Node::Raw(_) => element.children.push(raw),
             }
-            Node::Element(mut inner) => {
-                replace_newlines(&mut inner);
-                element.children.push(Node::Element(inner));
-            }
-            raw @ Node::Raw(_) => element.children.push(raw),
         }
-    }
+    });
 }
 
 /// What a glossary marker asks for: the extension's renderer options.
@@ -770,7 +848,7 @@ pub(crate) struct Renderer<'a> {
     request: &'a Value,
     groups: Vec<(String, Vec<&'a Value>)>,
     aliases: Option<&'a Map<String, Value>>,
-    compact: bool,
+    layout: Layout,
     styles: Box<Styles<'a>>,
     read_styles: Option<Vec<Value>>,
     filename_for: Box<FilenameFor<'a>>,
@@ -778,10 +856,15 @@ pub(crate) struct Renderer<'a> {
     /// Each dictionary's scoped stylesheet, as its `<style>` text.
     scoped: Vec<(String, String)>,
     sheets: compact::Sheets,
+    /// The language of the profile the note is mined in (docs/languages.md
+    /// 12); without one the note is today's.
+    language: Option<&'a NoteLanguage>,
+    /// `directions`: each dictionary's direction.
+    directions: HashMap<String, &'static str>,
 }
 
 impl<'a> Renderer<'a> {
-    pub(crate) fn new(request: &'a Value, compact: bool, styles: Box<Styles<'a>>, filename_for: Box<FilenameFor<'a>>) -> Self {
+    pub(crate) fn new(request: &'a Value, layout: Layout, styles: Box<Styles<'a>>, filename_for: Box<FilenameFor<'a>>) -> Self {
         let mut groups: Vec<(String, Vec<&Value>)> = Vec::new();
         for glossary in request["term"]["glossaries"].as_array().into_iter().flatten() {
             let dictionary = js::to_string(glossary.get("dictionary"));
@@ -794,14 +877,45 @@ impl<'a> Renderer<'a> {
             request,
             groups,
             aliases: request["dictionaryAliases"].as_object(),
-            compact,
+            layout,
             styles,
             read_styles: None,
             filename_for,
             prefix: None,
             scoped: Vec::new(),
             sheets: Vec::new(),
+            language: None,
+            directions: HashMap::new(),
         }
+    }
+
+    /// The renderer of a note mined in `language`.
+    pub(crate) fn in_language(mut self, language: Option<&'a NoteLanguage>) -> Self {
+        self.language = language;
+        self
+    }
+
+    /// `directionOf`: each dictionary's direction, as the mining request
+    /// carries it beside its display name, else by 10.2's rule over its glosses.
+    fn direction_of(&mut self, dictionary: &str) -> &'static str {
+        if let Some(direction) = self.directions.get(dictionary) {
+            return direction;
+        }
+        let carried = self.request["dictionaryDirections"].get(dictionary).and_then(Value::as_str);
+        let direction = match carried {
+            Some("rtl") => "rtl",
+            Some("ltr") => "ltr",
+            _ => self.language.map_or("ltr", |language| language.dictionary_direction(dictionary, self.request)),
+        };
+        self.directions.insert(dictionary.to_owned(), direction);
+        direction
+    }
+
+    /// `followsRtlRules`: every root of a note mined in a right-to-left
+    /// profile, and elsewhere a root that holds a right-to-left dictionary.
+    fn follows_rtl_rules(&mut self, names: &[&str]) -> bool {
+        let Some(language) = self.language else { return false };
+        language.direction == "rtl" || names.iter().any(|name| self.direction_of(name) == "rtl")
     }
 
     fn alias(&self, dictionary: &str) -> String {
@@ -811,13 +925,40 @@ impl<'a> Renderer<'a> {
         }
     }
 
-    /// `content`: one glossary's body.
-    fn content(&mut self, glossary: &Value, images: bool) -> Result<Element> {
+    /// `content`: one glossary's body. With a language, glossary text takes
+    /// 10.3's language, labelled where it differs from the dictionary's target
+    /// language, which the body carries. Under the right-to-left rules each
+    /// block of the other direction keeps its own, a row's text that sits in
+    /// the body itself included (10.2).
+    fn content(&mut self, glossary: &Value, images: bool, rtl_rules: bool) -> Result<Element> {
         let dictionary = js::to_string(glossary.get("dictionary"));
         let mut body = Element::with_class("div", "gsm-hoshidicts-glossary-content");
         body.set_data("hoshidictsDictionary", &dictionary);
-        let mut state = State { nodes: 0, dictionary, images: images.then_some(&mut *self.filename_for), path: Vec::new() };
+        let block_language = self.language.and_then(|language| language.dictionary_language(&dictionary));
+        if let Some(tag) = &block_language {
+            body.set_attribute("lang", tag);
+        }
+        let direction = rtl_rules.then(|| self.direction_of(&dictionary));
+        let mut state = State {
+            nodes: 0,
+            dictionary,
+            images: images.then_some(&mut *self.filename_for),
+            path: Vec::new(),
+            compact_glossaries: self.layout.compact_glossaries,
+            note: self.language,
+            block_language,
+            above: None,
+        };
         append_glossary(&mut body, glossary.get("glossary"), &mut state)?;
+        if let Some(direction) = direction
+            && (direction == "rtl" || has_rtl_text(&js::to_string(glossary.get("glossary"))))
+        {
+            let mut row = Element::new("div");
+            row.append(body);
+            mark_block_directions(&mut row, direction, "40px");
+            let Some(Node::Element(marked)) = row.children.pop() else { unreachable!("the row holds the body") };
+            body = marked;
+        }
         Ok(body)
     }
 
@@ -829,29 +970,46 @@ impl<'a> Renderer<'a> {
             }
             for glossary in glossaries {
                 let mut text = String::new();
-                plain_text(&Node::Element(self.content(glossary, false)?), &mut text);
+                plain_text(&Node::Element(self.content(glossary, false, false)?), &mut text);
                 out.extend(lines(&text).into_iter().map(js::trim).filter(|line| !line.is_empty()).map(escape_text));
             }
         }
         Ok(out.join("<br>"))
     }
 
-    fn entry(&mut self, glossary: &Value, brief: bool, no_dictionary: bool) -> Result<Element> {
+    fn entry(&mut self, glossary: &Value, brief: bool, no_dictionary: bool, rtl_rules: bool) -> Result<Element> {
         let mut wrapper = Element::new("div");
         let mut labels: Vec<String> = Vec::new();
+        let mut name = String::new();
         if !brief {
             labels.extend(definition_tags(glossary));
             labels.extend(tag_list(glossary.get("termTags")));
-            labels.push(if no_dictionary { String::new() } else { self.alias(&js::to_string(glossary.get("dictionary"))) });
             labels.retain(|label| !label.is_empty());
+            if !no_dictionary {
+                name = self.alias(&js::to_string(glossary.get("dictionary")));
+            }
         }
-        if !labels.is_empty() {
+        if !labels.is_empty() || !name.is_empty() {
             let mut meta = Element::with_class("i", "yomitan-glossary-meta");
-            meta.set_text(&format!("({})", labels.join(", ")));
+            if !name.is_empty() {
+                labels.push(String::new());
+            }
+            meta.append_text(&format!("({}", labels.join(", ")));
+            // A name with a right-to-left character sits alone in a dir="auto" element.
+            if rtl_rules && has_rtl_text(&name) {
+                let mut isolated = Element::new("span");
+                isolated.set_attribute("dir", "auto");
+                isolated.set_text(&name);
+                meta.append(isolated);
+            } else {
+                meta.append_text(&name);
+            }
+            meta.append_text(")");
+            meta.normalize();
             wrapper.append(meta);
             wrapper.append_text(" ");
         }
-        let mut body = self.content(glossary, true)?;
+        let mut body = self.content(glossary, true, rtl_rules)?;
         replace_newlines(&mut body);
         wrapper.append(body);
         Ok(wrapper)
@@ -905,8 +1063,8 @@ impl<'a> Renderer<'a> {
         Ok(())
     }
 
-    /// `appendDetails`.
-    fn append_details(&self, root: &mut Element) {
+    /// `appendDetails`: the footer is English.
+    fn append_details(&self, root: &mut Element, rtl_rules: bool) {
         let mut details: Vec<String> = Vec::new();
         let term = &self.request["term"];
         if js::truthy(term.get("rules")) {
@@ -926,6 +1084,9 @@ impl<'a> Renderer<'a> {
             return;
         }
         let mut small = Element::with_class("small", "yomitan-glossary-details");
+        if rtl_rules {
+            small.set_attribute("dir", "ltr");
+        }
         small.append(Node::Raw(details.join("<br>")));
         root.append(small);
     }
@@ -950,24 +1111,59 @@ impl<'a> Renderer<'a> {
         if self.read_styles.is_none() {
             self.read_styles = Some((self.styles)()?);
         }
+        // `glossaryRoot`: under the right-to-left rules the root takes its
+        // dictionaries' direction, ltr included, so a right-to-left card cannot
+        // turn English glosses around. Dictionaries of both directions keep
+        // each item's own, and the list pads both sides so every number stays
+        // inside the field.
+        let names: Vec<&str> = selected.iter().map(|(name, _)| name.as_str()).collect();
+        let rtl_rules = self.follows_rtl_rules(&names);
+        let mut directions: Vec<&'static str> = Vec::new();
+        if rtl_rules {
+            for name in &names {
+                let direction = self.direction_of(name);
+                if !directions.contains(&direction) {
+                    directions.push(direction);
+                }
+            }
+        }
+        let mixed = directions.len() > 1;
+        let align = if rtl_rules { "start" } else { "left" };
         let mut root = Element::with_class("div", "yomitan-glossary");
-        root.set_css_text("text-align: left; contain: layout paint style; isolation: isolate;");
+        root.set_css_text(&format!("text-align: {align}; contain: layout paint style; isolation: isolate;"));
+        if rtl_rules {
+            let direction = if mixed { self.language.map_or("ltr", |language| language.direction) } else { directions[0] };
+            root.set_attribute("dir", direction);
+        }
         let mut list = Element::new("ol");
+        if mixed {
+            list.set_style("padding-inline", "40px");
+        }
         for (name, glossaries) in &selected {
             for glossary in glossaries {
                 let mut page = Element::new("li");
                 page.set_data("dictionary", name);
-                page.append(self.entry(glossary, wanted.brief, wanted.no_dictionary)?);
+                if mixed {
+                    page.set_attribute("dir", self.direction_of(name));
+                }
+                page.append(self.entry(glossary, wanted.brief, wanted.no_dictionary, rtl_rules)?);
                 list.append(page);
             }
         }
         root.append(list);
         self.append_styles(&mut root, &selected)?;
-        if !wanted.brief && !self.compact {
-            self.append_details(&mut root);
+        if self.layout.compact_glossaries {
+            let mut style = Element::new("style");
+            style.append_text(COMPACT_GLOSS_STYLES);
+            root.append(style);
         }
-        if self.compact {
-            return Ok(compact::compact(root, &mut self.sheets));
+        // Yomitan's {glossary} has no footer; {part-of-speech} and {conjugation}
+        // carry it, so compact fields leave it out (#399).
+        if !wanted.brief && !self.layout.compact {
+            self.append_details(&mut root, rtl_rules);
+        }
+        if self.layout.compact {
+            return Ok(compact::compact(root, &mut self.sheets, align));
         }
         apply_class_styles(&mut root, 0);
         Ok(root.outer_html())
@@ -1004,9 +1200,13 @@ mod tests {
     use super::*;
 
     fn render(request: &Value, wanted: &Wanted, compact: bool) -> String {
+        render_in(request, wanted, Layout { compact, compact_glossaries: false })
+    }
+
+    fn render_in(request: &Value, wanted: &Wanted, layout: Layout) -> String {
         let mut renderer = Renderer::new(
             request,
-            compact,
+            layout,
             Box::new(|| Ok(vec![])),
             Box::new(|dictionary: &str, path: &str| Ok(format!("{dictionary}/{path}"))),
         );
@@ -1032,6 +1232,72 @@ mod tests {
         let wanted = Wanted { plain: true, no_dictionary: true, dictionary: Some("K".to_owned()), ..Wanted::default() };
         assert_eq!(render(&request(&glossary), &wanted, false), "二");
         assert_eq!(render(&request(&glossary), &Wanted { dictionary: Some("Z".to_owned()), ..Wanted::default() }, false), "");
+    }
+
+    // #673: Yomitan's glossary-single template joins a row's elements with " | "
+    // and its compact gloss styles put a structured glossary list on one line.
+    #[test]
+    fn compact_popup_and_anki_joins_a_rows_glosses() {
+        let request = request(&json!(["to live on (e.g. a salary)", "to live off", "to subsist on"]));
+        let only_j = Wanted { dictionary: Some("J".to_owned()), ..Wanted::default() };
+        let default = render(&request, &only_j, false);
+        assert_eq!(default.matches("<li class=\"gloss-item\"").count(), 3, "the default layout keeps Yomitan's list");
+        assert!(!default.contains("<style>"));
+        let layout = Layout { compact: false, compact_glossaries: true };
+        let html = render_in(&request, &only_j, layout);
+        assert!(html.contains(">to live on (e.g. a salary) | to live off | to subsist on</div>"), "{html}");
+        assert!(html.contains("<style>.yomitan-glossary ul[data-sc-content=\"glossary\"] > li:not(:first-child)::before {"), "{html}");
+        let plain = render_in(&request, &Wanted { plain: true, ..only_j }, layout);
+        assert_eq!(plain, "(Jitendex)<br>to live on (e.g. a salary) | to live off | to subsist on");
+        let smaller = render_in(
+            &request,
+            &Wanted { dictionary: Some("J".to_owned()), ..Wanted::default() },
+            Layout { compact: true, compact_glossaries: true },
+        );
+        assert!(smaller.contains("to live on (e.g. a salary) | to live off | to subsist on"), "{smaller}");
+    }
+
+    // A glossary list Compact popup and Anki's styles show inline is unwrapped by
+    // Smaller Anki cards, as any inline element.
+    #[test]
+    fn smaller_cards_unwrap_inline_glossary_lists() {
+        let list = json!([{ "type": "structured-content", "content": { "tag": "ul", "data": { "content": "glossary" }, "content": [
+            { "tag": "li", "content": "a" }, { "tag": "li", "content": "b" },
+        ] } }]);
+        let only_j = Wanted { dictionary: Some("J".to_owned()), ..Wanted::default() };
+        let listed = render_in(&request(&list), &only_j, Layout { compact: true, compact_glossaries: false });
+        assert!(listed.contains("<ul data-sc-content=\"glossary\">"), "{listed}");
+        let inline = render_in(&request(&list), &only_j, Layout { compact: true, compact_glossaries: true });
+        assert!(inline.contains("<span data-sc-content=\"glossary\">a | b</span>"), "{inline}");
+    }
+
+    fn nested(depth: usize) -> Value {
+        let glossary = format!(
+            "[{{\"type\":\"structured-content\",\"content\":{}[\"before <&>\",{{\"tag\":\"p\",\"content\":\"paragraph\"}},{{\"tag\":\"a\",\"href\":\"https://example.com/\",\"content\":\"link\"}},\" after\"]{}}}]",
+            "{\"tag\":\"span\",\"content\":".repeat(depth),
+            "}".repeat(depth),
+        );
+        json!({ "term": { "glossaries": [{ "dictionary": "A", "glossary": glossary }] } })
+    }
+
+    // The extension's "plain Anki definitions traverse deeply nested content
+    // without recursion": structured content has a node limit, not a depth one.
+    #[test]
+    fn deeply_nested_content_renders_without_a_depth_limit() {
+        let plain = Wanted { plain: true, no_dictionary: true, ..Wanted::default() };
+        assert_eq!(render(&nested(6000), &plain, false), "before &lt;&amp;&gt;paragraph<br>link after");
+        let deep = nested(200_000);
+        assert_eq!(render(&deep, &plain, false), "before &lt;&amp;&gt;paragraph<br>link after");
+        // Rich fields at depth are compared with the extension's renderer by
+        // tests/conformance/anki-oracle.test.mjs; here they must only complete.
+        for compact in [false, true] {
+            let rich = render(&deep, &Wanted::default(), compact);
+            assert!(
+                rich.contains("before &lt;&amp;&gt;") && rich.contains(">link") && rich.contains(" after"),
+                "{}",
+                &rich[rich.len().saturating_sub(300)..]
+            );
+        }
     }
 
     #[test]

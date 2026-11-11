@@ -49,6 +49,50 @@ jobs:
       - name: 128 MiB stress
         run: cargo test --release --test limits -- --ignored
 
+  # The oracle suites run the same requests through Hachidori's own code and the
+  # relay and require the same answers. HACHIDORI_COMMIT is the version host mode
+  # follows (docs/host-mode.md, "Compatible Hachidori").
+  oracles:
+    name: oracles
+    runs-on: ubuntu-latest
+    env:
+      HACHIDORI_COMMIT: d41c37abe4ea54ef6ec885e9517bbf5655f3d718
+      HACHIDORI_ORACLES: required
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/checkout@v4
+        with:
+          repository: bee-san/hachidori
+          ref: ${{ env.HACHIDORI_COMMIT }}
+          path: .hachidori
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: GCC 14
+        run: |
+          echo "CC=gcc-14" >> "$GITHUB_ENV"
+          echo "CXX=g++-14" >> "$GITHUB_ENV"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Hachidori test tooling and fixtures
+        working-directory: .hachidori
+        run: |
+          npm ci --prefix test/tooling --ignore-scripts
+          node test/make-fixture.mjs
+      - run: cargo build --features host
+      - name: oracle suites
+        env:
+          HACHIDORI_SOURCE: ${{ github.workspace }}/.hachidori
+        run: >-
+          node --test
+          tests/conformance/host-oracle.test.mjs tests/conformance/import-oracle.test.mjs
+          tests/conformance/mutations-oracle.test.mjs tests/conformance/settings-oracle.test.mjs
+          tests/conformance/anki-oracle.test.mjs tests/conformance/anki-index.test.mjs
+          tests/conformance/anki-index-languages.test.mjs
+          tests/conformance/profiles-oracle.test.mjs tests/conformance/sharing-oracle.test.mjs
+
   msrv:
     name: MSRV (1.88)
     runs-on: ubuntu-latest

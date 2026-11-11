@@ -13,7 +13,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { crc32 } from "node:zlib";
 import { relayBinary, startAnkiRelayServer } from "./anki-relay-server.mjs";
-import { connectClient, untilKind } from "./relay-socket.mjs";
+import { connectClient, connectHost, eventually, untilKind } from "./relay-socket.mjs";
 
 const HOST_MODE = execFileSync(relayBinary(), ["--help"], { encoding: "utf8" }).includes("--host");
 const GENERATION_1 = "/dicts/.hdw-generation-1/Fixture";
@@ -60,13 +60,11 @@ function zip(entries) {
 
 // The one-dictionary archive the extension's hd_api_dictionary_open builds.
 function archive(path, blobs, id = "fixture") {
-  const manifest = { format: "hachidori-backup", version: 3, snapshot: { state: { dictionaries: [{ id, path, title: id }] } } };
-  return zip([
-    ["hachidori-backup.json", JSON.stringify(manifest)],
-    ["dictionaries/0/.hoshidicts_5", ""],
-    ["dictionaries/0/index.json", "{}"],
-    ["dictionaries/0/blobs.bin", blobs],
-  ]);
+  const payload = [["dictionaries/0/.hoshidicts_5", ""], ["dictionaries/0/index.json", "{}"], ["dictionaries/0/blobs.bin", blobs]];
+  const files = payload.map(([name, data]) => ({ path: name, size: Buffer.byteLength(data) }));
+  const manifest = { format: "hachidori-backup", version: 3, createdAt: "2026-11-06T00:00:00.000Z",
+    snapshot: { state: { dictionaries: [{ id, path, title: id }] } }, files };
+  return zip([["hachidori-backup.json", JSON.stringify(manifest)], ...payload]);
 }
 
 function dictionaryState(path) {
@@ -87,11 +85,7 @@ const installed = (dir) => readdirSync(join(dir, "dictionaries"));
 // Waits until the installed generations are `expected`: the relay publishes a new list
 // first and deletes the generations it no longer names just after.
 async function installedBecome(dir, expected) {
-  const deadline = Date.now() + 10_000;
-  while (JSON.stringify(installed(dir).sort()) !== JSON.stringify([...expected].sort()) && Date.now() < deadline) {
-    await new Promise((resolve) => setTimeout(resolve, 20));
-  }
-  assert.deepEqual(installed(dir).sort(), [...expected].sort());
+  await eventually("the installed generations", () => assert.deepEqual(installed(dir).sort(), [...expected].sort()));
 }
 
 async function hostRelay(t, dir) {
@@ -102,11 +96,9 @@ async function hostRelay(t, dir) {
 
 // The browser host's side: it answers the relay's pull session.
 async function browserHost(t, port, snapshot) {
-  const socket = await connectClient(t, port, "/host");
-  assert.equal(socket.status, 101);
-  await untilKind(socket, "listening");
+  const socket = await connectHost(t, port);
   const open = await untilKind(socket, "client-open");
-  assert.equal(open.origin, "relay://yomitan-api", "the pull session identifies as the relay's own client");
+  assert.equal(open.origin, "relay://hachidori-relay", "the pull session identifies as the relay mirror");
   const host = {
     socket,
     async said() {
@@ -276,6 +268,27 @@ test("a linked browser with another protocol is told bye and closed", { skip: !H
   socket.send(JSON.stringify({ kind: "hello", protocol: 2 }));
   assert.equal((await untilKind(socket, "bye")).reason, "unsupported sharing protocol 2");
   await socket.closeFrame();
+});
+
+// Upstream's sharing-protocol.test.mjs "frames are validated on both sides" and
+// "linked Anki submissions have one 16 MiB UTF-8 frame limit": the host's
+// parseClientFrame closes a link that sends either.
+test("a malformed request or an oversized Anki submission is told bye", { skip: !HOST_MODE && "built without host mode" }, async (t) => {
+  const relay = await hostRelay(t, scratch(t));
+  for (const [frame, reason] of [
+    [{ kind: "request", id: 1 }, "malformed sharing request"],
+    [{ kind: "request", id: 1, message: [] }, "malformed sharing request"],
+    [{ kind: "request", id: 1, message: { target: "hoshidicts-offscreen" } }, "malformed sharing request"],
+    [{ kind: "request", id: 1, message: { target: 5, type: "hd_status" } }, "malformed sharing request"],
+    [{ kind: "request", id: true, message: { target: "hoshidicts-offscreen", type: "hd_status" } }, "malformed sharing request"],
+    [{ kind: "request", id: 1, message: { target: "hachidori-anki", type: "hd_anki_submit", request: { term: "é".repeat(8 * 1024 * 1024) } } },
+      "The linked Anki submission exceeds the 16 MiB frame limit."],
+  ]) {
+    const { socket } = await link(t, relay.port);
+    socket.send(JSON.stringify(frame));
+    assert.equal((await untilKind(socket, "bye")).reason, reason, JSON.stringify(frame).slice(0, 120));
+    await socket.closeFrame();
+  }
 });
 
 test("without --host the relay still refuses clients while no browser host is connected", { skip: !HOST_MODE && "built without host mode" }, async (t) => {

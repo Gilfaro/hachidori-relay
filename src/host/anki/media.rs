@@ -168,6 +168,94 @@ pub(crate) fn prepare(
     Ok(files)
 }
 
+/// A file a native add carries: `{filename, data, type, kind, required}`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AddFile {
+    pub(crate) filename: String,
+    pub(crate) data: String,
+    /// `type`: a picture (`<img>`), or audio (`[sound:]`).
+    pub(crate) picture: bool,
+    pub(crate) kind: String,
+    /// A file the note cannot go without: its failure fails the add.
+    pub(crate) required: bool,
+}
+
+impl AddFile {
+    fn reference(&self) -> String {
+        if self.picture { format!("<img src=\"{}\">", self.filename) } else { format!("[sound:{}]", self.filename) }
+    }
+}
+
+/// `attachAnkiAddMedia`: AnkiConnect's `addNote` stores native `audio` and
+/// `picture` attachments and appends their stored filenames to their fields, so a
+/// field that is only the file's reference is emptied and the file attached.
+/// Files inside rich HTML must keep their exact position: those are stored
+/// together, each reply checked, before the note is sent. A failed optional file
+/// loses its references and leaves a warning; a failed required one fails.
+pub(crate) fn attach_add_media(
+    fields: &mut Fields,
+    attachments: &mut Map<String, Value>,
+    files: &[AddFile],
+    invoke: &Invoke<'_>,
+) -> Result<Vec<String>> {
+    let mut warnings = Vec::new();
+    let mut failed = |fields: &mut Fields, file: &AddFile, message: String| -> Result<()> {
+        if file.required {
+            return Err(Failure::new(message));
+        }
+        let reference = file.reference();
+        for (_, value) in fields.iter_mut() {
+            *value = value.replace(&reference, "");
+        }
+        warnings.push(format!("{}: {message}", file.kind));
+        Ok(())
+    };
+    let mut uploads: Vec<&AddFile> = Vec::new();
+    for file in files {
+        if decoded_base64_length(Some(&json!(file.data))).is_none_or(|bytes| bytes < 1) {
+            failed(fields, file, format!("The {} payload is not valid base64.", file.kind))?;
+            continue;
+        }
+        let reference = file.reference();
+        let named: Vec<String> = fields.iter().filter(|(_, value)| value.contains(&file.filename)).map(|(name, _)| name.clone()).collect();
+        if named.is_empty() {
+            continue;
+        }
+        if !file.required && fields.iter().filter(|(name, _)| named.contains(name)).all(|(_, value)| *value == reference) {
+            for (name, value) in fields.iter_mut() {
+                if named.contains(name) {
+                    value.clear();
+                }
+            }
+            let key = if file.picture { "picture" } else { "audio" };
+            let list = attachments.entry(key).or_insert_with(|| Value::Array(Vec::new()));
+            if let Some(list) = list.as_array_mut() {
+                list.push(json!({ "filename": file.filename, "data": file.data, "fields": named, "deleteExisting": false }));
+            }
+        } else {
+            uploads.push(file);
+        }
+    }
+    if uploads.is_empty() {
+        return Ok(warnings);
+    }
+    let actions: Vec<Value> = uploads
+        .iter()
+        .map(|file| json!({ "action": "storeMediaFile", "params": { "filename": file.filename, "data": file.data, "deleteExisting": false } }))
+        .collect();
+    let results = invoke("multi", json!({ "actions": actions }), Some(STORE_TIMEOUT_MS))?;
+    let results = results.as_array().ok_or_else(|| Failure::new("Anki returned an invalid media reply."))?;
+    for (reply, file) in results.iter().zip(&uploads) {
+        let error = reply.get("error").filter(|error| !error.is_null());
+        if let Some(error) = error {
+            failed(fields, file, super::gateway::describe(&js::to_string(Some(error))))?;
+        } else if reply.get("result").and_then(Value::as_str) != Some(file.filename.as_str()) {
+            failed(fields, file, "Anki stored media under a different filename.".to_owned())?;
+        }
+    }
+    Ok(warnings)
+}
+
 /// A linked browser's screenshot, checked.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Screenshot {

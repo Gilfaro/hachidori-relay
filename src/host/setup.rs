@@ -10,15 +10,16 @@
 
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{Map, Value, json};
 
-use super::engine::{Engine, IMPORT_IN_PROGRESS};
+use super::engine::{Engine, IMPORT_IN_PROGRESS, Progress};
 use super::js;
+use super::profile::JAPANESE;
 use super::remote::{self, Fetch, RECOMMENDED, Recommended};
-use super::settings::options;
 use super::settings::worker::{self, Storage};
+use super::settings::{options, profiles};
 use super::store;
 
 /// `RECOMMENDED_SELECTIONS_KEY`: the sources whose first install chose their option.
@@ -27,6 +28,8 @@ const SELECTIONS_KEY: &str = "recommendedDictionarySelections";
 const SETUP_STATE_KEY: &str = "setupState";
 const OPTIONS_KEY: &str = "options";
 /// `IDLE_POLL_MS`: how often a waiting install looks for the engine to be free.
+/// `Number.isSafeInteger`'s bound, for a declared archive size.
+const MAX_SAFE_INTEGER: u64 = (1 << 53) - 1;
 const IDLE_POLL: Duration = Duration::from_millis(250);
 /// `RECORD_RETRY_MS` and `RECORD_RETRY_MAX_MS`.
 const RECORD_RETRY: Duration = Duration::from_millis(250);
@@ -38,8 +41,23 @@ type Result<T> = std::result::Result<T, String>;
 struct Entry {
     source: &'static Recommended,
     phase: &'static str,
+    received_bytes: u64,
+    total_bytes: Option<u64>,
     seconds: Option<f64>,
     error: Option<String>,
+    /// `installStartedAt`: when the engine reported "installing".
+    install_started: Option<Instant>,
+}
+
+impl Entry {
+    fn new(source: &'static Recommended) -> Self {
+        Self { source, phase: "waiting", received_bytes: 0, total_bytes: None, seconds: None, error: None, install_started: None }
+    }
+
+    /// The installation's duration so far, excluding the download.
+    fn install_seconds(&self) -> Option<f64> {
+        self.install_started.map(|started| started.elapsed().as_secs_f64())
+    }
 }
 
 /// The active or last run.
@@ -48,6 +66,28 @@ struct Run {
     sequence: u64,
     finished: bool,
     entries: Vec<Entry>,
+}
+
+impl Run {
+    fn progress(&mut self, index: usize, event: Progress) {
+        let Some(entry) = self.entries.get_mut(index).filter(|entry| entry.phase == "downloading" || entry.phase == "installing") else {
+            return;
+        };
+        if self.finished {
+            return;
+        }
+        match event {
+            Progress::Installing => {
+                entry.phase = "installing";
+                entry.install_started.get_or_insert_with(Instant::now);
+            }
+            Progress::Downloading { received, total } => {
+                entry.received_bytes = received;
+                entry.total_bytes = total.filter(|total| *total > 0 && *total <= MAX_SAFE_INTEGER);
+            }
+        }
+        self.sequence += 1;
+    }
 }
 
 /// How a source settled.
@@ -105,6 +145,9 @@ fn first_install_selections(
         return Ok((applied, None));
     }
     let revision = js::number(worker::options_revision(stored));
+    if profiles::has_profiles(stored) {
+        return Ok((applied, japanese_profile_selections(stored, state, patch, revision)?));
+    }
     let mut merged = options::project_stored(stored);
     merged.extend(options::validate_patch(Some(&Value::Object(patch)))?);
     merged.insert("revision".to_owned(), revision.clone());
@@ -117,6 +160,32 @@ fn first_install_selections(
     }
     next["revision"] = js::number(worker::options_revision(stored) + 1.0);
     Ok((applied, Some(next)))
+}
+
+/// `japaneseProfileSelections`: Jitendex and Bee's Ultimate Kanji Dictionary
+/// are the Japanese profile's, so on records with profiles the selections go
+/// into it (against its view of the dictionaries), or nowhere without one.
+fn japanese_profile_selections(stored: Option<&Value>, state: &Value, patch: Map<String, Value>, revision: Value) -> Result<Option<Value>> {
+    if !profiles::profiles(stored).iter().any(|profile| profile["id"] == JAPANESE) {
+        return Ok(None);
+    }
+    let view = profiles::project_dictionary_state(Some(state), JAPANESE).unwrap_or_else(|| json!({ "dictionaries": [], "groups": [] }));
+    let list = |key: &str| view.get(key).and_then(Value::as_array).cloned().unwrap_or_default();
+    let (dictionaries, groups) = (list("dictionaries"), list("groups"));
+    let mut record = profiles::apply_options_patch(stored, &options::validate_patch(Some(&Value::Object(patch)))?, JAPANESE)?;
+    for profile in record.get_mut("profiles").and_then(Value::as_array_mut).into_iter().flatten() {
+        if profile["id"] == JAPANESE {
+            let settings = profile.get("settings").cloned().unwrap_or(Value::Null);
+            profile["settings"] = options::normalise_dictionary_selections(&settings, &dictionaries, &groups)?;
+        }
+    }
+    let mut base = stored.and_then(Value::as_object).cloned().unwrap_or_default();
+    base.insert("revision".to_owned(), revision);
+    if js::same_json(&Value::Object(record.clone()), &Value::Object(base)) {
+        return Ok(None);
+    }
+    record.insert("revision".to_owned(), js::number(worker::options_revision(stored) + 1.0));
+    Ok(Some(Value::Object(record)))
 }
 
 impl<S: Storage + Send + Sync + 'static> Setup<S> {
@@ -137,8 +206,8 @@ impl<S: Storage + Send + Sync + 'static> Setup<S> {
             .entries
             .iter()
             .map(|entry| {
-                json!({ "sourceId": entry.source.source_id, "phase": entry.phase, "receivedBytes": 0, "totalBytes": null,
-                    "seconds": entry.seconds, "error": entry.error })
+                json!({ "sourceId": entry.source.source_id, "phase": entry.phase, "receivedBytes": entry.received_bytes,
+                    "totalBytes": entry.total_bytes, "seconds": entry.seconds, "error": entry.error })
             })
             .collect();
         worker_map(json!({ "runId": run.id, "sequence": run.sequence, "finished": run.finished, "entries": entries }))
@@ -169,7 +238,7 @@ impl<S: Storage + Send + Sync + 'static> Setup<S> {
             let mut run = self.current();
             if run.as_ref().is_none_or(|run| run.finished) && !sources.is_empty() {
                 let id = worker::random_uuid().unwrap_or_else(|_| format!("{:x}", js::now().to_bits()));
-                let entries = sources.iter().map(|&source| Entry { source, phase: "waiting", seconds: None, error: None }).collect();
+                let entries = sources.iter().map(|&source| Entry::new(source)).collect();
                 *run = Some(Run { id: id.clone(), sequence: 0, finished: false, entries });
                 let setup = self.clone();
                 thread::spawn(move || setup.execute(&id, sources));
@@ -216,17 +285,27 @@ impl<S: Storage + Send + Sync + 'static> Setup<S> {
             if remote::installed(source, &self.dictionaries()).is_some() {
                 return Outcome { status: "already-installed", seconds: None, error: None };
             }
-            let reply = self.engine.import_remote(&self.storage, &self.lock, self.fetch.as_ref(), &message);
+            let reply =
+                self.engine.import_remote(&self.storage, &self.lock, self.fetch.as_ref(), &message, &|event| self.progress(index, event));
             if reply["error"] == IMPORT_IN_PROGRESS {
                 thread::sleep(IDLE_POLL);
                 continue;
             }
+            let seconds = self.current().as_ref().and_then(|run| run.entries[index].install_seconds());
             if reply["ok"] == true && reply["report"]["success"] == true {
-                return Outcome { status: "installed", seconds: Some(0.0), error: None };
+                return Outcome { status: "installed", seconds: Some(seconds.unwrap_or(0.0)), error: None };
             }
             let error = [&reply["error"], &reply["report"]["error"]].into_iter().find_map(|error| error.as_str().filter(|e| !e.is_empty()));
             let error = error.unwrap_or("the import did not complete").to_owned();
-            return Outcome { status: "failed", seconds: None, error: Some(error) };
+            return Outcome { status: "failed", seconds, error: Some(error) };
+        }
+    }
+
+    /// `progress`: the engine's download and installation phases for this
+    /// installer's import of the entry at `index`.
+    fn progress(&self, index: usize, event: Progress) {
+        if let Some(run) = self.current().as_mut() {
+            run.progress(index, event);
         }
     }
 
@@ -289,6 +368,32 @@ mod tests {
 
     static NEXT: AtomicUsize = AtomicUsize::new(0);
 
+    /// Upstream's profiles.test.mjs "first-install selections write the
+    /// Japanese profile, and nothing without one".
+    #[test]
+    fn first_install_selections_write_the_japanese_profile() {
+        let row = json!({ "id": "j", "title": "Jitendex", "sourceId": "jitendex", "termCount": 1, "enabled": true });
+        let profile = |id: &str| json!({ "id": id, "language": id, "settings": {}, "packSettings": {} });
+        let stored = json!({ "revision": 9, "anki": { "url": "http://127.0.0.1:8765", "apiKey": "" },
+            "profiles": [profile("ja"), profile("en")] });
+        let state = json!({ "schemaVersion": 2, "revision": 3, "dictionaries": [row], "groups": [],
+            "profiles": { "ja": { "dictionaries": [{ "id": "j", "enabled": true }], "groups": [] },
+                "en": { "dictionaries": [], "groups": [] } } });
+        let (applied, options) = first_install_selections(&[], ("jitendex", "installed"), &state, Some(&stored)).unwrap();
+        assert_eq!(applied, ["jitendex"]);
+        let options = options.unwrap();
+        assert_eq!(options["revision"], 10);
+        assert_eq!(options["profiles"][0]["settings"]["compactDefinitionSummaryDictionary"], "Jitendex");
+        assert!(options["profiles"][1]["settings"].get("compactDefinitionSummaryDictionary").is_none());
+        assert!(options.get("compactDefinitionSummaryDictionary").is_none(), "nothing at the top level");
+
+        let mut without = stored.clone();
+        without["profiles"] = json!([profile("en")]);
+        let (applied, options) = first_install_selections(&[], ("jitendex", "installed"), &state, Some(&without)).unwrap();
+        assert_eq!(applied, ["jitendex"]);
+        assert_eq!(options, None);
+    }
+
     fn installer(stored: Value, served: Served) -> Arc<Setup<Memory>> {
         let storage = Memory(Mutex::new(worker_map(stored)));
         let store =
@@ -327,6 +432,37 @@ mod tests {
         panic!("the setup run did not finish");
     }
 
+    fn served_size(setup: &Arc<Setup<Memory>>, url: &str) -> usize {
+        let mut body = Vec::new();
+        setup.fetch.get(url, None).unwrap().body.read_to_end(&mut body).unwrap();
+        body.len()
+    }
+
+    // `progress`: downloading reports bytes, installing starts the clock, and
+    // nothing moves an entry that is not importing.
+    #[test]
+    fn engine_progress_moves_only_an_importing_entry() {
+        let setup = installer(state(&json!([])), Served::default());
+        let kanji = source("bees-ultimate-kanji-dictionary");
+        *setup.current() = Some(Run { id: "r".to_owned(), sequence: 0, finished: false, entries: vec![Entry::new(kanji)] });
+        let entry = |setup: &Arc<Setup<Memory>>| install(setup, &[])["entries"][0].clone();
+        setup.progress(0, Progress::Downloading { received: 5, total: Some(10) });
+        assert_eq!(entry(&setup)["receivedBytes"], 0, "a waiting entry is not downloading yet");
+        setup.step(Some(0), |entry| entry.phase = "downloading");
+        setup.progress(0, Progress::Downloading { received: 5, total: Some(10) });
+        assert_eq!((entry(&setup)["receivedBytes"].clone(), entry(&setup)["totalBytes"].clone()), (json!(5), json!(10)));
+        setup.progress(0, Progress::Downloading { received: 7, total: None });
+        assert_eq!(entry(&setup)["totalBytes"], Value::Null);
+        setup.progress(0, Progress::Installing);
+        assert_eq!(entry(&setup)["phase"], "installing");
+        assert!(setup.current().as_ref().unwrap().entries[0].install_seconds().is_some());
+        let sequence = install(&setup, &[])["sequence"].clone();
+        setup.step(Some(0), |entry| entry.phase = "installed");
+        setup.progress(0, Progress::Downloading { received: 9, total: None });
+        assert_eq!(entry(&setup)["receivedBytes"], 7, "a settled entry keeps its last report");
+        assert_eq!(install(&setup, &[])["sequence"], json!(sequence.as_u64().unwrap() + 1));
+    }
+
     #[test]
     fn requests_are_checked_and_an_empty_one_observes() {
         let setup = installer(state(&json!([])), Served::default());
@@ -360,6 +496,13 @@ mod tests {
         let phases: Vec<&Value> = done["entries"].as_array().unwrap().iter().map(|entry| &entry["phase"]).collect();
         assert_eq!(phases, [&json!("installed"), &json!("failed")], "{done}");
         assert_eq!(done["entries"][1]["error"], "jiten-frequency.zip: reading the archive failed. Failed to fetch");
+        // The download's bytes, against the declared length; the installation's
+        // duration excludes the download, and a source that never began
+        // installing has none.
+        let size = served_size(&setup, kanji.download_url);
+        assert_eq!((&done["entries"][0]["receivedBytes"], &done["entries"][0]["totalBytes"]), (&json!(size), &json!(size)));
+        assert!(done["entries"][0]["seconds"].as_f64().is_some_and(|seconds| seconds >= 0.0), "{done}");
+        assert_eq!(done["entries"][1]["seconds"], Value::Null);
 
         let stored = setup.dictionaries();
         let installed = stored.iter().find(|entry| entry["sourceId"] == kanji.source_id).unwrap();

@@ -26,26 +26,50 @@ impl Node {
     }
 
     fn collect_text(&self, out: &mut String) {
-        match self {
+        deep(|| match self {
             Self::Text(text) => out.push_str(text),
             Self::Element(element) => element.children.iter().for_each(|child| child.collect_text(out)),
             Self::Raw(_) => {}
-        }
+        });
     }
 
     fn serialize(&self, parent: Option<&str>, out: &mut String) {
-        match self {
+        deep(|| match self {
             Self::Text(text) if parent.is_some_and(|name| RAW_TEXT.contains(&name)) => out.push_str(text),
             Self::Text(text) => out.push_str(&escape_text(text)),
             Self::Raw(markup) => out.push_str(markup),
             Self::Element(element) => element.serialize(out),
-        }
+        });
     }
 }
 
 impl From<Element> for Node {
     fn from(element: Element) -> Self {
         Self::Element(element)
+    }
+}
+
+/// Runs one step of a walk over a rendered tree. Structured content has a node
+/// limit but no depth limit, so the stack grows onto the heap as a walk goes
+/// deeper, where the extension's walks keep their own stacks.
+#[inline]
+pub(crate) fn deep<R>(step: impl FnOnce() -> R) -> R {
+    stacker::maybe_grow(128 * 1024, 1024 * 1024, step)
+}
+
+impl Clone for Element {
+    // The derived clone follows the nesting.
+    fn clone(&self) -> Self {
+        deep(|| Self { name: self.name.clone(), attributes: self.attributes.clone(), children: self.children.clone() })
+    }
+}
+
+impl Drop for Element {
+    // The default drop follows the nesting.
+    fn drop(&mut self) {
+        if self.children.iter().any(|child| matches!(child, Node::Element(_))) {
+            deep(|| self.children.clear());
+        }
     }
 }
 
@@ -85,7 +109,7 @@ fn escape_attribute(value: &str) -> String {
 }
 
 /// An element.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, PartialEq, Eq, Default)]
 pub(crate) struct Element {
     pub(crate) name: String,
     pub(crate) attributes: Vec<(String, String)>,
@@ -94,7 +118,7 @@ pub(crate) struct Element {
 
 impl Element {
     pub(crate) fn new(name: &str) -> Self {
-        Self { name: name.to_owned(), ..Self::default() }
+        Self { name: name.to_owned(), attributes: Vec::new(), children: Vec::new() }
     }
 
     /// An element of `name` with `className`.
@@ -228,53 +252,59 @@ impl Element {
     }
 
     fn serialize(&self, out: &mut String) {
-        out.push('<');
-        out.push_str(&self.name);
-        for (name, value) in &self.attributes {
-            out.push(' ');
-            out.push_str(name);
-            out.push_str("=\"");
-            out.push_str(&escape_attribute(value));
-            out.push('"');
-        }
-        out.push('>');
-        if VOID.contains(&self.name.as_str()) {
-            return;
-        }
-        for child in &self.children {
-            child.serialize(Some(&self.name), out);
-        }
-        out.push_str("</");
-        out.push_str(&self.name);
-        out.push('>');
+        deep(|| {
+            out.push('<');
+            out.push_str(&self.name);
+            for (name, value) in &self.attributes {
+                out.push(' ');
+                out.push_str(name);
+                out.push_str("=\"");
+                out.push_str(&escape_attribute(value));
+                out.push('"');
+            }
+            out.push('>');
+            if VOID.contains(&self.name.as_str()) {
+                return;
+            }
+            for child in &self.children {
+                child.serialize(Some(&self.name), out);
+            }
+            out.push_str("</");
+            out.push_str(&self.name);
+            out.push('>');
+        });
     }
 
     /// `normalize()`: adjacent text joined, empty text dropped, throughout.
     pub(crate) fn normalize(&mut self) {
-        let mut merged: Vec<Node> = Vec::with_capacity(self.children.len());
-        for child in std::mem::take(&mut self.children) {
-            match (child, merged.last_mut()) {
-                (Node::Text(text), _) if text.is_empty() => {}
-                (Node::Text(text), Some(Node::Text(previous))) => previous.push_str(&text),
-                (Node::Element(mut element), _) => {
-                    element.normalize();
-                    merged.push(Node::Element(element));
+        deep(|| {
+            let mut merged: Vec<Node> = Vec::with_capacity(self.children.len());
+            for child in std::mem::take(&mut self.children) {
+                match (child, merged.last_mut()) {
+                    (Node::Text(text), _) if text.is_empty() => {}
+                    (Node::Text(text), Some(Node::Text(previous))) => previous.push_str(&text),
+                    (Node::Element(mut element), _) => {
+                        element.normalize();
+                        merged.push(Node::Element(element));
+                    }
+                    (other, _) => merged.push(other),
                 }
-                (other, _) => merged.push(other),
             }
-        }
-        self.children = merged;
+            self.children = merged;
+        });
     }
 
     /// Every text node, in document order.
     pub(crate) fn texts_mut(&mut self, visit: &mut impl FnMut(&mut String)) {
-        for child in &mut self.children {
-            match child {
-                Node::Text(text) => visit(text),
-                Node::Element(element) => element.texts_mut(visit),
-                Node::Raw(_) => {}
+        deep(|| {
+            for child in &mut self.children {
+                match child {
+                    Node::Text(text) => visit(text),
+                    Node::Element(element) => element.texts_mut(visit),
+                    Node::Raw(_) => {}
+                }
             }
-        }
+        });
     }
 }
 

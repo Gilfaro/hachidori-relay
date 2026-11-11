@@ -227,10 +227,20 @@ async fn yomitan_version(server: &Server) -> Result<Response<Body>, ApiError> {
     Ok(raw_response(&ask(server, "hd_api_version", json!({})).await?))
 }
 
+/// The request's `profileIndex`, which selects the language profile the host
+/// answers from (upstream docs/languages.md 12): Yomitan reads a number as a
+/// profile index, and anything else as the active profile, Hachidori's 0.
+fn profiled(body: &Map<String, Value>, mut payload: Value) -> Value {
+    if let (Some(index @ Value::Number(_)), Some(fields)) = (body.get("profileIndex"), payload.as_object_mut()) {
+        fields.insert("profileIndex".to_owned(), index.clone());
+    }
+    payload
+}
+
 async fn term_entries(server: &Server, body: &Map<String, Value>) -> Result<Response<Body>, ApiError> {
     let (terms, single) = strings(body, "term")?;
     let count = terms.len();
-    let response = ask(server, "hd_api_term_entries", json!({ "terms": terms })).await?;
+    let response = ask(server, "hd_api_term_entries", profiled(body, json!({ "terms": terms }))).await?;
     let (all, items) = results(&response, count)?;
     Ok(raw_response(if single { items[0] } else { all }))
 }
@@ -238,7 +248,7 @@ async fn term_entries(server: &Server, body: &Map<String, Value>) -> Result<Resp
 async fn kanji_entries(server: &Server, body: &Map<String, Value>) -> Result<Response<Body>, ApiError> {
     let (characters, single) = strings(body, "character")?;
     let count = characters.len();
-    let response = ask(server, "hd_api_kanji_entries", json!({ "characters": characters })).await?;
+    let response = ask(server, "hd_api_kanji_entries", profiled(body, json!({ "characters": characters }))).await?;
     let (all, items) = results(&response, count)?;
     if !single {
         return Ok(raw_response(all));
@@ -271,18 +281,13 @@ async fn anki_fields(server: &Server, body: &Map<String, Value>) -> Result<Respo
     }
     // Yomitan's "type" travels as entryType, because "type" names the message itself.
     let payload = json!({ "text": text, "entryType": kind, "markers": markers, "maxEntries": max_entries, "includeMedia": include_media });
-    let response = ask(server, "hd_api_anki_fields", payload).await?;
+    let response = ask(server, "hd_api_anki_fields", profiled(body, payload)).await?;
     array_field(&response, "fields")?;
     Ok(raw_response(&response))
 }
 
 async fn anki_card_formats(server: &Server, body: &Map<String, Value>) -> Result<Response<Body>, ApiError> {
-    // Yomitan reads a number as a profile index, and anything else as the active profile.
-    let payload = match body.get("profileIndex") {
-        Some(index @ Value::Number(_)) => json!({ "profileIndex": index }),
-        _ => json!({}),
-    };
-    let response = ask(server, "hd_api_anki_card_formats", payload).await?;
+    let response = ask(server, "hd_api_anki_card_formats", profiled(body, json!({}))).await?;
     Ok(raw_response(array_field(&response, "cardFormats")?))
 }
 
@@ -296,7 +301,8 @@ async fn tokenize(server: &Server, body: &Map<String, Value>) -> Result<Response
     if !parser.is_string() {
         return Err(ApiError::bad_request("expected \"parser\" to be a string"));
     }
-    let response = ask(server, "hd_api_tokenize", json!({ "texts": texts, "scanLength": scan_length, "parser": parser })).await?;
+    let response =
+        ask(server, "hd_api_tokenize", profiled(body, json!({ "texts": texts, "scanLength": scan_length, "parser": parser }))).await?;
     Ok(raw_response(array_field(&response, "results")?))
 }
 

@@ -18,9 +18,12 @@ use serde_json::{Map, Value, json};
 
 use super::anki::{self, Anki};
 use super::engine::{self, Engine};
+use super::profile;
 use super::remote::{self, Fetch};
+use super::settings::profile_worker;
 use super::settings::worker::{self, Storage};
 use super::setup::Setup;
+use super::sharing_languages::{self, Connection, Handled, Hooks};
 use super::store::{self, Store};
 use super::updates::{self, Updates};
 use super::upload::{self, Request, Uploads};
@@ -51,10 +54,40 @@ struct ClientFrame<'a> {
     capabilities: Option<&'a RawValue>,
 }
 
+/// A request message's routing fields, read without the rest of it.
+#[derive(Deserialize)]
+struct MessageHead<'a> {
+    #[serde(default, borrow, deserialize_with = "json::present")]
+    target: Option<&'a RawValue>,
+    #[serde(default, borrow, rename = "type", deserialize_with = "json::present")]
+    kind: Option<&'a RawValue>,
+}
+
+/// `MAX_LINKED_ANKI_FRAME_BYTES`: a linked Anki submission's one frame limit.
+const MAX_LINKED_ANKI_FRAME_BYTES: usize = 16 * 1024 * 1024;
+
+/// `parseClientFrame`'s request checks: the message is an object with a string
+/// `target` and `type`, and the id a string or number; a linked Anki
+/// submission (`assertLinkedAnkiFrame`) fits in 16 MiB of UTF-8.
+fn request_frame_error(text: &str, id: Option<&RawValue>, message: Option<&RawValue>) -> Option<&'static str> {
+    let head =
+        message.filter(|raw| json::is_object_text(raw.get())).and_then(|raw| serde_json::from_str::<MessageHead<'_>>(raw.get()).ok());
+    let string = |raw: Option<&RawValue>| raw.and_then(json::as_str).map(Cow::into_owned);
+    let (target, kind) = match &head {
+        Some(head) => (string(head.target), string(head.kind)),
+        None => (None, None),
+    };
+    let id_ok = id.is_some_and(|id| json::as_str(id).is_some() || id.get().trim().parse::<f64>().is_ok());
+    let (Some(target), Some(kind), true) = (target, kind, id_ok) else { return Some("malformed sharing request") };
+    (target == "hachidori-anki" && kind == "hd_anki_submit" && text.len() > MAX_LINKED_ANKI_FRAME_BYTES)
+        .then_some("The linked Anki submission exceeds the 16 MiB frame limit.")
+}
+
 /// One linked client.
 #[derive(Debug, Default)]
 struct Client {
-    origin: String,
+    /// What the language hooks keep on it, its origin included.
+    connection: Connection,
     address: Option<IpAddr>,
     greeted: bool,
     /// What its hello said it supports (`parseCapabilities`).
@@ -78,6 +111,27 @@ fn capabilities(raw: Option<&RawValue>) -> Option<Vec<String>> {
     Some(list)
 }
 
+/// The linked clients and the language hooks, which every commit and every
+/// request reads. Taken after the store's lock and before the relay's.
+#[derive(Debug, Default)]
+pub(crate) struct Linked {
+    clients: HashMap<Arc<str>, Client>,
+    hooks: Hooks,
+}
+
+fn lock(linked: &Mutex<Linked>) -> std::sync::MutexGuard<'_, Linked> {
+    linked.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// `closeIfDone`: a connection marked closing goes once nothing it asked is still running.
+fn close_if_done(relay: &Shared, client: &str, connection: &mut Connection) {
+    if !connection.closing || connection.closed || connection.running > 0 {
+        return;
+    }
+    connection.closed = true;
+    relay.close_local_client(client);
+}
+
 /// The store as the worker requests see it: their writes are published to linked clients.
 pub(crate) struct Published {
     anki: Arc<Anki>,
@@ -91,17 +145,26 @@ impl Storage for Published {
     fn write(&self, values: Map<String, Value>) -> Result<(), String> {
         self.anki.publish(values).map(drop).map_err(|error| format!("could not save the relay's storage: {error}"))
     }
+
+    fn keys_with(&self, prefix: &str) -> Vec<String> {
+        self.anki.keys_with(prefix)
+    }
 }
 
 /// Every write to the store, told to linked clients in the order it was stored.
 pub(crate) struct Publisher {
     store: Arc<Store>,
     relay: Weak<Shared>,
+    linked: Arc<Mutex<Linked>>,
 }
 
 impl Publisher {
     pub(crate) fn read(&self, key: &str) -> Option<Value> {
         self.store.get(key)
+    }
+
+    pub(crate) fn keys_with(&self, prefix: &str) -> Vec<String> {
+        self.store.keys_with(prefix)
     }
 
     /// Stores `changes` and tells every linked client.
@@ -110,18 +173,23 @@ impl Publisher {
     }
 
     /// Stores the changes `derive` makes of what is stored, as one write, and tells
-    /// every linked client: shared keys as a `storage` frame, and a duplicate index
+    /// every linked client: shared keys as a `storage` frame, each connection's own
+    /// once the records have profiles (`storageChanged`), and a duplicate index
     /// change as a `word-status` frame.
     pub(crate) fn publish_with(
         &self,
         derive: impl FnOnce(&BTreeMap<String, Value>) -> Map<String, Value>,
     ) -> std::io::Result<Map<String, Value>> {
         let previous = RefCell::new(None);
+        let old_options = RefCell::new(None);
         self.store.apply_with(
             |storage| {
                 let mut changes = derive(storage);
                 anki::derive_index(storage, &mut changes);
                 *previous.borrow_mut() = anki::stored_index(storage);
+                if changes.contains_key(worker::OPTIONS_KEY) {
+                    *old_options.borrow_mut() = storage.get(worker::OPTIONS_KEY).cloned();
+                }
                 changes
             },
             |changed| {
@@ -129,13 +197,36 @@ impl Publisher {
                 let shared: Map<String, Value> =
                     changed.iter().filter(|(key, _)| store::is_shared_key(key)).map(|(k, v)| (k.clone(), v.clone())).collect();
                 if !shared.is_empty() {
-                    relay.broadcast_local(&Bytes::from(owned_json!({ "kind": "storage", "changes": shared }).to_string()));
+                    self.storage_changed(&relay, &shared, old_options.borrow().as_ref());
                 }
                 if let Some(frame) = anki::word_status(previous.borrow().as_ref(), changed) {
                     relay.broadcast_local(&Bytes::from(frame.to_string()));
                 }
             },
         )
+    }
+
+    /// One commit's shared changes, told to the linked clients.
+    #[expect(clippy::significant_drop_tightening, reason = "the clients stay locked while the frames go out, in commit order")]
+    fn storage_changed(&self, relay: &Shared, shared: &Map<String, Value>, old_options: Option<&Value>) {
+        let mut linked = lock(&self.linked);
+        let Linked { clients, hooks } = &mut *linked;
+        let plan = hooks.storage_changed(shared, old_options, clients.values_mut().map(|client| &mut client.connection));
+        let Some(sharing_languages::Plan { descriptor }) = plan else {
+            relay.broadcast_local(&Bytes::from(json!({ "kind": "storage", "changes": shared }).to_string()));
+            return;
+        };
+        // With profiles each connection gets its own frame (docs/languages.md 17.3).
+        for (id, client) in clients.iter_mut() {
+            let connection = &mut client.connection;
+            if connection.closing {
+                close_if_done(relay, id, connection);
+                continue;
+            }
+            if let Some(changes) = sharing_languages::frame(connection, shared, descriptor.as_ref()) {
+                relay.send_to_client(id, Bytes::from(owned_json!({ "kind": "storage", "changes": changes }).to_string()));
+            }
+        }
     }
 }
 
@@ -146,7 +237,7 @@ pub(crate) struct Local {
     engine: Arc<Engine>,
     api: Arc<Api>,
     version: String,
-    clients: Mutex<HashMap<Arc<str>, Client>>,
+    linked: Arc<Mutex<Linked>>,
     uploads: Arc<Uploads>,
     anki: Arc<Anki>,
     /// One storage request at a time (`serialiseStorage`).
@@ -161,7 +252,9 @@ impl Local {
     pub(crate) fn new(relay: &Arc<Shared>, store: Arc<Store>, version: &str) -> Arc<Self> {
         let engine_store = store.clone();
         let engine = Arc::new(Engine::new(store.clone()));
-        let anki = Anki::new(Arc::new(Publisher { store: engine_store.clone(), relay: Arc::downgrade(relay) }), engine.clone());
+        let linked = Arc::<Mutex<Linked>>::default();
+        let publisher = Publisher { store: engine_store.clone(), relay: Arc::downgrade(relay), linked: linked.clone() };
+        let anki = Anki::new(Arc::new(publisher), engine.clone());
         let api = Arc::new(Api::new(engine.clone(), anki.clone(), store.clone(), version));
         let (storage, fetch): (Arc<Mutex<()>>, Arc<dyn Fetch>) = (Arc::default(), Arc::new(remote::Http));
         let updates = Arc::new(Updates::new(Published { anki: anki.clone() }, storage.clone(), engine.clone(), fetch.clone()));
@@ -172,7 +265,7 @@ impl Local {
             engine,
             api,
             version: format!("hachidori-relay/{version}"),
-            clients: Mutex::default(),
+            linked,
             uploads: Uploads::new(Arc::clone(&engine_store)),
             anki,
             storage,
@@ -203,9 +296,18 @@ impl Local {
         Published { anki: self.anki.clone() }
     }
 
-    /// The hello for one client. Built while the store is consistent with what it has broadcast.
-    fn hello(&self) -> Value {
-        let snapshot = self.store.snapshot();
+    /// The hello for one client: the snapshot, or its Japanese view and the
+    /// profile capability once the records have profiles (`languages.hello`).
+    fn hello(&self, snapshot: Map<String, Value>, profiles: bool) -> Value {
+        // The extension's host list, in its order (SHARING_HOST_CAPABILITIES): both
+        // Anki capabilities, so a reader that predates Templates still mines with
+        // the first one (worker::compatible_options_message), then the API and
+        // chunked imports.
+        let mut capabilities =
+            vec![worker::LEGACY_LINKED_ANKI_CAPABILITY, worker::LINKED_ANKI_CAPABILITY, CAPABILITY_API, upload::CAPABILITY];
+        if profiles {
+            capabilities.push(sharing_languages::CAPABILITY);
+        }
         let dictionary_count = snapshot.get(store::DICTIONARY_STATE).map_or(0, |state| store::generations(state).len());
         owned_json!({
             "kind": "hello",
@@ -213,7 +315,7 @@ impl Local {
             "version": self.version.as_str(),
             "name": NAME,
             "dictionaryCount": dictionary_count,
-            "capabilities": json!([CAPABILITY_API, upload::CAPABILITY, worker::LINKED_ANKI_CAPABILITY]),
+            "capabilities": capabilities,
             "snapshot": snapshot,
         })
     }
@@ -229,12 +331,29 @@ impl Local {
     fn request(&self, client: &str, id: &RawValue, message: Option<&RawValue>) {
         let message: Value = message.and_then(|raw| serde_json::from_str(raw.get()).ok()).unwrap_or(Value::Null);
         let id: Value = serde_json::from_str(id.get()).unwrap_or(Value::Null);
-        let reply = move |relay: &Weak<Shared>, client: &str, response: Value| {
-            if let Some(relay) = relay.upgrade() {
-                relay.send_to_client(client, Bytes::from(reply_frame(&id, &response)));
-            }
+        let route = route(&message);
+        if matches!(route, Route::OptIn) {
+            return self.opt_in(client, &id, &message);
+        }
+        let handled = {
+            let mut linked = lock(&self.linked);
+            let Linked { clients, hooks } = &mut *linked;
+            let Some(entry) = clients.get_mut(client) else { return };
+            entry.connection.running += 1;
+            let handled = hooks.request(message, &entry.connection);
+            drop(linked);
+            handled
         };
-        match route(&message) {
+        let message = match handled {
+            Handled::Message(message) => message,
+            Handled::Response(response) => return self.answered(id, None)(&self.relay, client, response),
+        };
+        let reply = self.answered(id, Some(message.get("type").and_then(Value::as_str).unwrap_or_default().to_owned()));
+        let message = match self.with_profile(&route, message) {
+            Ok(message) => message,
+            Err(refused) => return reply(&self.relay, client, refused),
+        };
+        match route {
             Route::Engine => {
                 let (engine, relay, client) = (self.engine.clone(), self.relay.clone(), client.to_owned());
                 tokio::task::spawn_blocking(move || reply(&relay, &client, engine.handle(&message)));
@@ -247,8 +366,7 @@ impl Local {
                 });
             }
             Route::Worker => {
-                let capabilities =
-                    self.clients.lock().unwrap_or_else(PoisonError::into_inner).get(client).map(|entry| entry.capabilities.clone());
+                let capabilities = lock(&self.linked).clients.get(client).map(|entry| entry.capabilities.clone());
                 let storage = self.published();
                 let (lock, relay, client) = (self.storage.clone(), self.relay.clone(), client.to_owned());
                 tokio::task::spawn_blocking(move || {
@@ -275,7 +393,7 @@ impl Local {
                 let (lock, engine, fetch, relay, client) =
                     (self.storage.clone(), self.engine.clone(), self.fetch.clone(), self.relay.clone(), client.to_owned());
                 tokio::task::spawn_blocking(move || {
-                    reply(&relay, &client, engine.import_remote(&storage, &lock, fetch.as_ref(), &message));
+                    reply(&relay, &client, engine.import_remote(&storage, &lock, fetch.as_ref(), &message, &|_| {}));
                 });
             }
             Route::Updates => {
@@ -286,6 +404,7 @@ impl Local {
                 let (setup, relay, client) = (self.setup.clone(), self.relay.clone(), client.to_owned());
                 tokio::task::spawn_blocking(move || reply(&relay, &client, setup.handle(&message)));
             }
+            Route::OptIn => unreachable!("answered before the hooks"),
             Route::Upload => self.upload(client, message, reply),
             Route::Anki => {
                 let (anki, relay, client) = (self.anki.clone(), self.relay.clone(), client.to_owned());
@@ -300,6 +419,54 @@ impl Local {
             }
             Route::Fail(error) => reply(&self.relay, client, failure(&message, &error)),
         }
+    }
+
+    /// The request with its profile's fields, or the refusal of the profile it names.
+    fn with_profile(&self, route: &Route, message: Value) -> Result<Value, Value> {
+        if matches!(route, Route::Engine | Route::Mutation) {
+            let (options, state) = (self.store.get(worker::OPTIONS_KEY), self.store.get(store::DICTIONARY_STATE));
+            return match profile_worker::with_profile_fields(&message, options.as_ref(), state.as_ref()) {
+                Some(Ok(resolved)) => Ok(resolved),
+                Some(Err(refused)) => Err(failure_with_code(&message, &refused.error, refused.code)),
+                None => Ok(message),
+            };
+        }
+        Ok(message)
+    }
+
+    /// The reply to one request, as `answerRequest` sends it: through the reply
+    /// hook when it was dispatched (`kind` is its type), then the connection
+    /// closes if it was marked closing and nothing else of it runs.
+    #[expect(clippy::significant_drop_tightening, reason = "the clients stay locked while the frames go out, in commit order")]
+    fn answered(&self, id: Value, kind: Option<String>) -> impl FnOnce(&Weak<Shared>, &str, Value) + Send + 'static {
+        let linked = self.linked.clone();
+        move |relay: &Weak<Shared>, client: &str, response: Value| {
+            let Some(relay) = relay.upgrade() else { return };
+            let mut linked = lock(&linked);
+            let Some(entry) = linked.clients.get_mut(client) else { return };
+            let connection = &mut entry.connection;
+            connection.running = connection.running.saturating_sub(1);
+            let response = match &kind {
+                Some(kind) => Hooks::reply(response, kind, connection),
+                None => response,
+            };
+            relay.send_to_client(client, Bytes::from(reply_frame(&id, &response)));
+            close_if_done(&relay, client, connection);
+        }
+    }
+
+    /// `answerLanguageOptIn`, with the store held from the snapshot to the reply.
+    #[expect(clippy::significant_drop_tightening, reason = "the clients stay locked while the frames go out, in commit order")]
+    fn opt_in(&self, client: &str, id: &Value, message: &Value) {
+        let Some(relay) = self.relay.upgrade() else { return };
+        self.store.with_snapshot(|snapshot| {
+            let mut linked = lock(&self.linked);
+            let Linked { clients, hooks } = &mut *linked;
+            let Some(entry) = clients.get_mut(client) else { return };
+            let response = hooks.opt_in(message, &mut entry.connection, snapshot);
+            relay.send_to_client(client, Bytes::from(reply_frame(id, &response)));
+            close_if_done(&relay, client, &mut entry.connection);
+        });
     }
 
     /// `answerUploadRequest`: one request of a linked browser's dictionary upload.
@@ -324,8 +491,8 @@ impl Local {
             Err(error) => failure(&echo, &error),
         };
         match request {
-            Request::Begin { file_name, size, replace } => {
-                reply(&relay, client, answered(uploads.begin(&owner, &file_name, size, replace)));
+            Request::Begin { file_name, size, replace, profile_id } => {
+                reply(&relay, client, answered(uploads.begin(&owner, &file_name, size, replace, profile_id)));
             }
             Request::Abort { token } => reply(&relay, client, answered(Ok(uploads.abort(client, &token)))),
             Request::Chunk { token, offset, data } => {
@@ -342,7 +509,14 @@ impl Local {
                     let imported = {
                         let _serialised = lock.lock().unwrap_or_else(PoisonError::into_inner);
                         uploads.commit(&owner, &token).and_then(|complete| {
-                            engine.import_upload(&storage, &complete.file, &complete.file_name, complete.replace, &request_id)
+                            engine.import_upload(
+                                &storage,
+                                &complete.file,
+                                &complete.file_name,
+                                complete.replace,
+                                complete.profile_id.as_deref(),
+                                &request_id,
+                            )
                         })
                     };
                     let response = match imported {
@@ -376,6 +550,8 @@ enum Route {
     Setup,
     /// A linked browser's dictionary upload.
     Upload,
+    /// `hd_language_profiles_opt_in`.
+    OptIn,
     /// A `hachidori-anki` request, or Settings' Anki discovery and setup check.
     Anki,
     Fail(String),
@@ -400,6 +576,8 @@ fn forwarded(target: &str) -> Option<&'static [&'static str]> {
             "hd_reload",
             "hd_remove",
             "hd_import",
+            "hd_profile_add",
+            "hd_profile_remove",
         ],
         "hoshidicts-worker" => &worker::REQUESTS,
         "hachidori-updates" => &["hd_updates_schedule", "hd_updates_check", "hd_updates_install"],
@@ -421,6 +599,10 @@ fn route(message: &Value) -> Route {
     }
     if target.and_then(Value::as_str) == Some("hoshidicts-worker") && matches!(kind, "hd_anki_discover" | "hd_anki_setup") {
         return Route::Anki;
+    }
+    // The sharing host's own request (HOST_LANGUAGE_HOOKS), answered whatever the records.
+    if target.and_then(Value::as_str) == Some("hoshidicts-worker") && kind == profile::OPT_IN {
+        return Route::OptIn;
     }
     let Some(types) = target.and_then(Value::as_str).and_then(forwarded) else {
         return match target.and_then(Value::as_str) {
@@ -463,20 +645,30 @@ fn reply_frame(id: &Value, response: &Value) -> String {
 }
 
 pub(crate) fn failure(message: &Value, error: &str) -> Value {
+    failure_with_code(message, error, None)
+}
+
+/// `failureReply` for an error that carries a `code`.
+pub(crate) fn failure_with_code(message: &Value, error: &str, code: Option<&str>) -> Value {
     let kind = message.get("type").and_then(Value::as_str).unwrap_or("hd_unknown");
-    json!({
+    let mut reply = json!({
         "type": format!("{kind}_result"),
         "requestId": message.get("requestId").cloned().unwrap_or(Value::Null),
         "ok": false,
         "error": error,
         "generation": 0,
-    })
+    });
+    if let Some(code) = code {
+        reply["errorCode"] = Value::from(code);
+    }
+    reply
 }
 
 impl LocalHost for Local {
     fn opened(&self, client: &Arc<str>, origin: &str, address: IpAddr) {
-        let entry = Client { origin: origin.to_owned(), address: Some(address), ..Client::default() };
-        self.clients.lock().unwrap_or_else(PoisonError::into_inner).insert(client.clone(), entry);
+        let connection = Connection { origin: origin.to_owned(), ..Connection::default() };
+        let entry = Client { connection, address: Some(address), ..Client::default() };
+        lock(&self.linked).clients.insert(client.clone(), entry);
         tracing::info!(%client, origin, %address, "a browser linked to the relay");
     }
 
@@ -486,6 +678,7 @@ impl LocalHost for Local {
         }
     }
 
+    #[expect(clippy::significant_drop_tightening, reason = "the clients stay locked while the frames go out, in commit order")]
     fn text(&self, client: &Arc<str>, text: &str) {
         let frame = json::is_object_text(text).then(|| serde_json::from_str::<ClientFrame<'_>>(text).ok()).flatten();
         let Some(frame) = frame else { return self.bye(client, "malformed sharing frame") };
@@ -499,15 +692,25 @@ impl LocalHost for Local {
                 let Some(capabilities) = capabilities(frame.capabilities) else {
                     return self.bye(client, "malformed sharing capabilities");
                 };
-                if let Some(entry) = self.clients.lock().unwrap_or_else(PoisonError::into_inner).get_mut(client) {
-                    entry.greeted = true;
-                    entry.capabilities = capabilities;
-                }
-                self.send(client, &self.hello());
+                // Sent while the store is held, so no commit after this snapshot is
+                // told to the client before its hello.
+                self.store.with_snapshot(|snapshot| {
+                    let mut linked = lock(&self.linked);
+                    let Linked { clients, hooks } = &mut *linked;
+                    if let Some(entry) = clients.get_mut(client) {
+                        entry.greeted = true;
+                        entry.capabilities = capabilities;
+                    }
+                    let hello = match hooks.hello(&snapshot) {
+                        Some(view) => self.hello(view, true),
+                        None => self.hello(snapshot, false),
+                    };
+                    self.send(client, &hello);
+                });
             }
-            Some("request") => match frame.id {
-                Some(id) if json::as_str(id).is_some() || id.get().trim().parse::<f64>().is_ok() => self.request(client, id, frame.message),
-                _ => self.bye(client, "malformed sharing request"),
+            Some("request") => match (request_frame_error(text, frame.id, frame.message), frame.id) {
+                (None, Some(id)) => self.request(client, id, frame.message),
+                (error, _) => self.bye(client, error.unwrap_or("malformed sharing request")),
             },
             Some("pong") => {}
             Some(other) => self.bye(client, &format!("unknown sharing frame {}", Value::from(other))),
@@ -517,9 +720,9 @@ impl LocalHost for Local {
 
     fn closed(&self, client: &Arc<str>) {
         self.uploads.drop_owner(client);
-        let gone = self.clients.lock().unwrap_or_else(PoisonError::into_inner).remove(client);
+        let gone = lock(&self.linked).clients.remove(client);
         if let Some(gone) = gone {
-            tracing::info!(%client, origin = gone.origin, address = ?gone.address, greeted = gone.greeted, "a linked browser left");
+            tracing::info!(%client, origin = gone.connection.origin, address = ?gone.address, greeted = gone.greeted, "a linked browser left");
         }
     }
 }

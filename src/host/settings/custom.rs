@@ -9,12 +9,66 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::host::js::{self, strict_eq};
+use crate::host::profile::JAPANESE;
+use crate::host::registry;
 
 pub(crate) const CUSTOM_DICTIONARY_ID: &str = "e4c2e20a1a964b6cbd4ae3f87643c1f0";
 pub(crate) const CUSTOM_DICTIONARY_TITLE: &str = "Hachidori Custom Dictionary";
 pub(crate) const CUSTOM_DICTIONARY_SOURCE_KEY: &str = "customDictionarySource";
 const SCHEMA_VERSION: u64 = 1;
-const EMPTY_SEMANTIC_REVISION: &str = "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945";
+pub(crate) const EMPTY_SEMANTIC_REVISION: &str = "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945";
+
+/// `personalDictionaryIdentity`: a language's personal package (docs/languages.md
+/// 15 upstream). Japanese keeps the package above; another language's fixed id and
+/// title come from its registry descriptor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Identity {
+    pub(crate) id: String,
+    pub(crate) title: String,
+    pub(crate) language: String,
+    pub(crate) reading_required: bool,
+}
+
+/// `JAPANESE_PERSONAL_DICTIONARY`: the package every release before profiles kept.
+pub(crate) fn japanese() -> Identity {
+    Identity {
+        id: CUSTOM_DICTIONARY_ID.to_owned(),
+        title: CUSTOM_DICTIONARY_TITLE.to_owned(),
+        language: JAPANESE.to_owned(),
+        reading_required: true,
+    }
+}
+
+/// `personalDictionaryIdentity(language)`; `None` for a language this build has no pack for.
+pub(crate) fn identity(language: &str) -> Option<Identity> {
+    if language == JAPANESE {
+        return Some(japanese());
+    }
+    let descriptor = registry::get(language)?;
+    let personal = &descriptor["personalDictionary"];
+    Some(Identity {
+        id: personal["id"].as_str()?.to_owned(),
+        title: personal["title"].as_str()?.to_owned(),
+        language: language.to_owned(),
+        reading_required: descriptor.pointer("/capabilities/readings").is_some_and(|readings| readings == "required"),
+    })
+}
+
+/// `personalDictionaryIdentities`: Japanese's and each pack's.
+fn identities() -> impl Iterator<Item = Identity> {
+    std::iter::once(JAPANESE).chain(registry::codes().filter(|code| *code != JAPANESE)).filter_map(identity)
+}
+
+/// `isPersonalDictionaryTitle`: every personal title is reserved at import.
+pub(crate) fn is_personal_title(title: &str) -> bool {
+    identities().any(|identity| identity.title == title)
+}
+
+/// `personalDictionaryLanguage`: the language whose personal package a stored row is.
+pub(crate) fn personal_language(row: &Value) -> Option<String> {
+    let id = row.get("id")?.as_str()?;
+    identities().find(|identity| identity.id == id).map(|identity| identity.language)
+}
 
 /// One entry of the source: what a line names.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,33 +79,37 @@ pub(crate) struct Entry {
 }
 
 fn is_custom(dictionary: &Value) -> bool {
-    dictionary.get("id").and_then(Value::as_str) == Some(CUSTOM_DICTIONARY_ID)
+    is_package(dictionary, CUSTOM_DICTIONARY_ID)
+}
+
+fn is_package(dictionary: &Value, id: &str) -> bool {
+    dictionary.get("id").and_then(Value::as_str) == Some(id)
 }
 
 /// `customDictionaryMetadataMatches`.
-pub(crate) fn metadata_matches(value: &Value, semantic_revision: &str, entry_count: usize) -> bool {
+pub(crate) fn metadata_matches(value: &Value, semantic_revision: &str, entry_count: usize, identity: &Identity) -> bool {
     let number = |key: &str| value.get(key).and_then(Value::as_f64);
-    value.get("title").and_then(Value::as_str) == Some(CUSTOM_DICTIONARY_TITLE)
+    value.get("title").and_then(Value::as_str) == Some(identity.title.as_str())
         && value.get("revision").and_then(Value::as_str) == Some(semantic_revision)
         && strict_eq(value.get("termCount"), Some(&json!(entry_count)))
         && ["frequencyCount", "pitchCount", "kanjiCount", "mediaCount"].iter().all(|key| number(key) == Some(0.0))
         && value.get("isUpdatable") == Some(&Value::Bool(false))
         && value.get("indexUrl") == Some(&Value::Null)
         && value.get("downloadUrl") == Some(&Value::Null)
-        && value.get("language").and_then(Value::as_str) == Some("ja")
+        && value.get("language").and_then(Value::as_str) == Some(identity.language.as_str())
 }
 
 /// `assertCustomDictionaryCommit`.
-pub(crate) fn assert_commit(dictionaries: &[Value]) -> Result<(), String> {
+pub(crate) fn assert_commit(dictionaries: &[Value], identity: &Identity) -> Result<(), String> {
     let custom: Vec<usize> =
-        dictionaries.iter().enumerate().filter(|(_, dictionary)| is_custom(dictionary)).map(|(index, _)| index).collect();
+        dictionaries.iter().enumerate().filter(|(_, dictionary)| is_package(dictionary, &identity.id)).map(|(index, _)| index).collect();
     if custom.len() > 1 {
         return Err("the custom dictionary state contains duplicate managed packages".to_owned());
     }
     let Some(&index) = custom.first() else { return Ok(()) };
     let entry = &dictionaries[index];
     if index != 0
-        || entry.get("title").and_then(Value::as_str) != Some(CUSTOM_DICTIONARY_TITLE)
+        || entry.get("title").and_then(Value::as_str) != Some(identity.title.as_str())
         || entry.get("enabled") != Some(&Value::Bool(true))
     {
         return Err("the managed custom dictionary must stay enabled and first".to_owned());
@@ -59,24 +117,29 @@ pub(crate) fn assert_commit(dictionaries: &[Value]) -> Result<(), String> {
     if dictionaries
         .iter()
         .enumerate()
-        .any(|(other, dictionary)| other != index && dictionary.get("title").and_then(Value::as_str) == Some(CUSTOM_DICTIONARY_TITLE))
+        .any(|(other, dictionary)| other != index && dictionary.get("title").and_then(Value::as_str) == Some(identity.title.as_str()))
     {
-        return Err(format!("a dictionary named {CUSTOM_DICTIONARY_TITLE} is already installed"));
+        return Err(format!("a dictionary named {} is already installed", identity.title));
     }
     Ok(())
 }
 
 /// `assertCustomSourceState`.
-pub(crate) fn assert_source_state(dictionaries: &[Value], semantic_revision: &str, entry_count: usize) -> Result<(), String> {
-    let custom: Vec<&Value> = dictionaries.iter().filter(|dictionary| is_custom(dictionary)).collect();
+pub(crate) fn assert_source_state(
+    dictionaries: &[Value],
+    semantic_revision: &str,
+    entry_count: usize,
+    identity: &Identity,
+) -> Result<(), String> {
+    let custom: Vec<&Value> = dictionaries.iter().filter(|dictionary| is_package(dictionary, &identity.id)).collect();
     if entry_count == 0 {
         if !custom.is_empty() {
             return Err("a zero-entry custom source cannot retain its managed package".to_owned());
         }
         return Ok(());
     }
-    assert_commit(dictionaries)?;
-    if custom.len() != 1 || !metadata_matches(custom[0], semantic_revision, entry_count) {
+    assert_commit(dictionaries, identity)?;
+    if custom.len() != 1 || !metadata_matches(custom[0], semantic_revision, entry_count, identity) {
         return Err("the custom dictionary package does not match its source semantics".to_owned());
     }
     Ok(())
@@ -108,6 +171,49 @@ pub(crate) fn normalise_document(value: Option<&Value>) -> Result<Value, String>
     Ok(json!({ "schemaVersion": SCHEMA_VERSION, "revision": js::number(revision), "semanticRevision": semantic, "text": text }))
 }
 
+/// `customDictionaryLanguages`: the other languages' documents, by language.
+fn document_languages(record: Option<&Value>) -> Option<&serde_json::Map<String, Value>> {
+    record?.get("languages")?.as_object()
+}
+
+/// `customDictionaryDocumentFor`: one language's document; Japanese's is the
+/// record's top level.
+pub(crate) fn document_for(record: Option<&Value>, language: &str) -> Result<Value, String> {
+    if language == JAPANESE {
+        return normalise_document(record);
+    }
+    match document_languages(record).and_then(|languages| languages.get(language)).filter(|entry| !entry.is_null()) {
+        None => Ok(empty_document()),
+        Some(entry) => {
+            let mut entry = js::plain_object(Some(entry)).cloned().unwrap_or_default();
+            entry.insert("schemaVersion".to_owned(), json!(SCHEMA_VERSION));
+            normalise_document(Some(&Value::Object(entry)))
+        }
+    }
+}
+
+/// `withCustomDictionaryDocument`: the record with one language's document
+/// replaced and every other language's kept; a Japanese-only record keeps its shape.
+pub(crate) fn with_document(record: Option<&Value>, language: &str, document: &Value) -> Result<Value, String> {
+    let languages = document_languages(record).cloned();
+    if language == JAPANESE {
+        let mut next = document.as_object().cloned().unwrap_or_default();
+        if let Some(languages) = languages {
+            next.insert("languages".to_owned(), Value::Object(languages));
+        }
+        return Ok(Value::Object(next));
+    }
+    let top = normalise_document(record.filter(|record| !record.is_null()))?;
+    let mut top = top.as_object().cloned().unwrap_or_default();
+    let mut languages = languages.unwrap_or_default();
+    languages.insert(
+        language.to_owned(),
+        json!({ "revision": document["revision"], "semanticRevision": document["semanticRevision"], "text": document["text"] }),
+    );
+    top.insert("languages".to_owned(), Value::Object(languages));
+    Ok(Value::Object(top))
+}
+
 /// `decodeDefinition`: `\\` and `\n` escapes.
 fn decode_definition(value: &str) -> String {
     let mut decoded = String::with_capacity(value.len());
@@ -129,7 +235,7 @@ fn decode_definition(value: &str) -> String {
 }
 
 /// `parseCustomDictionary`: the entries of a source, and its line errors.
-pub(crate) fn parse(source: &str) -> (Vec<Entry>, Vec<Value>) {
+pub(crate) fn parse(source: &str, reading_required: bool) -> (Vec<Entry>, Vec<Value>) {
     let source = source.strip_prefix('\u{feff}').unwrap_or(source);
     let mut entries = Vec::new();
     let mut errors = Vec::new();
@@ -151,7 +257,7 @@ pub(crate) fn parse(source: &str) -> (Vec<Entry>, Vec<Value>) {
         let definition = decode_definition(js::trim(definition));
         if term.is_empty() {
             error("term is empty");
-        } else if reading.is_empty() {
+        } else if reading.is_empty() && reading_required {
             error("reading is empty");
         } else if js::trim(&definition).is_empty() {
             error("definition is empty");
@@ -163,7 +269,7 @@ pub(crate) fn parse(source: &str) -> (Vec<Entry>, Vec<Value>) {
 }
 
 /// `normaliseEntry`.
-fn normalise_entry(entry: &Entry) -> Result<Entry, String> {
+fn normalise_entry(entry: &Entry, reading_required: bool) -> Result<Entry, String> {
     let term = js::trim(&entry.term);
     let reading = js::trim(&entry.reading);
     let definition = js::trim(&entry.definition).replace("\r\n", "\n").replace('\r', "\n");
@@ -177,7 +283,7 @@ fn normalise_entry(entry: &Entry) -> Result<Entry, String> {
     if term.contains(',') || breaks(term) {
         return Err("the custom dictionary term cannot contain a comma or newline".to_owned());
     }
-    if reading.is_empty() {
+    if reading.is_empty() && reading_required {
         return Err("the custom dictionary reading is empty".to_owned());
     }
     if reading.contains(',') || breaks(reading) {
@@ -196,10 +302,10 @@ fn json_string(text: &str) -> String {
 
 /// `customDictionarySemanticRevision`: the SHA-256 of the normalised entries'
 /// `JSON.stringify`, in hex.
-pub(crate) fn semantic_revision(entries: &[Entry]) -> Result<String, String> {
+pub(crate) fn semantic_revision(entries: &[Entry], reading_required: bool) -> Result<String, String> {
     let mut json = String::from("[");
     for (index, entry) in entries.iter().enumerate() {
-        let entry = normalise_entry(entry)?;
+        let entry = normalise_entry(entry, reading_required)?;
         if index > 0 {
             json.push(',');
         }
@@ -259,15 +365,15 @@ pub(crate) fn assert_ordinary_transition(current: &[Value], next: &[Value]) -> R
 }
 
 /// `normaliseEntry` of an entry a request carried.
-fn entry_from(value: Option<&Value>) -> Result<Entry, String> {
+fn entry_from(value: Option<&Value>, reading_required: bool) -> Result<Entry, String> {
     let Some(fields) = js::plain_object(value) else { return Err("the custom dictionary entry must be an object".to_owned()) };
     let field = |key: &str| fields.get(key).and_then(Value::as_str).unwrap_or_default().to_owned();
-    normalise_entry(&Entry { term: field("term"), reading: field("reading"), definition: field("definition") })
+    normalise_entry(&Entry { term: field("term"), reading: field("reading"), definition: field("definition") }, reading_required)
 }
 
 /// `appendCustomDictionaryEntry`: `source` with one more line, in its own line endings.
-pub(crate) fn append(source: &str, entry: Option<&Value>) -> Result<String, String> {
-    let Entry { term, reading, definition } = entry_from(entry)?;
+pub(crate) fn append(source: &str, entry: Option<&Value>, reading_required: bool) -> Result<String, String> {
+    let Entry { term, reading, definition } = entry_from(entry, reading_required)?;
     let newline = if source.contains("\r\n") { "\r\n" } else { "\n" };
     let separator = if source.is_empty() || source.ends_with(['\r', '\n']) { "" } else { newline };
     let definition = definition.replace('\\', "\\\\").replace('\n', "\\n");
@@ -278,19 +384,19 @@ pub(crate) fn append(source: &str, entry: Option<&Value>) -> Result<String, Stri
 const TERM_BANK_SIZE: usize = 1000;
 
 /// `buildCustomDictionaryZip`: the Yomitan archive the custom package is imported from.
-pub(crate) fn build_zip(entries: &[Entry], revision: &str) -> Result<Vec<u8>, String> {
+pub(crate) fn build_zip(entries: &[Entry], revision: &str, identity: &Identity) -> Result<Vec<u8>, String> {
     if entries.is_empty() {
         return Err("the custom dictionary needs at least one entry".to_owned());
     }
     if revision.is_empty() {
         return Err("the custom dictionary needs a semantic revision".to_owned());
     }
-    let entries = entries.iter().map(normalise_entry).collect::<Result<Vec<_>, _>>()?;
+    let entries = entries.iter().map(|entry| normalise_entry(entry, identity.reading_required)).collect::<Result<Vec<_>, _>>()?;
     let mut files = vec![(
         "index.json".to_owned(),
         json!({
-            "title": CUSTOM_DICTIONARY_TITLE, "format": 3, "revision": revision, "sequenced": true, "author": "Hachidori",
-            "description": "Personal entries managed by Hachidori", "sourceLanguage": "ja", "targetLanguage": "en",
+            "title": identity.title, "format": 3, "revision": revision, "sequenced": true, "author": "Hachidori",
+            "description": "Personal entries managed by Hachidori", "sourceLanguage": identity.language, "targetLanguage": "en",
         }),
     )];
     for (bank, chunk) in entries.chunks(TERM_BANK_SIZE).enumerate() {
@@ -322,13 +428,13 @@ mod tests {
 
     #[test]
     fn the_empty_source_has_the_extensions_revision() {
-        assert_eq!(semantic_revision(&[]).as_deref(), Ok(EMPTY_SEMANTIC_REVISION));
+        assert_eq!(semantic_revision(&[], true).as_deref(), Ok(EMPTY_SEMANTIC_REVISION));
     }
 
     #[test]
     fn lines_parse_as_settings_writes_them() {
         let (entries, errors) =
-            parse("\u{feff}# note\r\n食べる, たべる, to eat\\nconsume\n\n  #x\nbad line\n,a,b\nx,,y\nx,y, \\\\ \r漢字,かんじ,a,b");
+            parse("\u{feff}# note\r\n食べる, たべる, to eat\\nconsume\n\n  #x\nbad line\n,a,b\nx,,y\nx,y, \\\\ \r漢字,かんじ,a,b", true);
         assert_eq!(
             entries,
             [

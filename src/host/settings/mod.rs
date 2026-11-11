@@ -4,6 +4,8 @@
 pub(crate) mod backup;
 pub(crate) mod custom;
 pub(crate) mod options;
+pub(crate) mod profile_worker;
+pub(crate) mod profiles;
 pub(crate) mod worker;
 
 /// Bytes as lower-case hexadecimal.

@@ -112,6 +112,21 @@ test("the relay changes dictionaries as the extension's own engine does", { skip
   reply = await step("custom line errors", (stored) => ({ type: "hd_custom_save", baseDocumentRevision: documentRevision(stored),
     text: "猫, ねこ, cat\r\nbroken line\r\n, x, y\r\n鳥, とり, bird\r\n" }));
   assert.equal(reply.errors.length, 2);
+  // A large source, CRLF, past the builder's 1000-row banks: 2,500 two-kanji
+  // words, each found in its own bank afterwards.
+  const KANJI = [..."山川田林森空海雨雪風花草木石金銀銅鉄火水土日月星光影音声色形心手足目耳口鼻歯骨血肉皮毛羽角尾虫魚鳥犬猫"];
+  const words = KANJI.flatMap((first) => KANJI.map((second) => `${first}${second}`)).slice(0, 2_500);
+  assert.equal(new Set(words).size, 2_500);
+  reply = await step("custom large", (stored) => ({ type: "hd_custom_save", baseDocumentRevision: documentRevision(stored),
+    text: words.map((word, index) => `${word}, よみ, meaning ${index}`).join("\r\n") }));
+  assert.equal(reply.ok, true, reply.error);
+  assert.equal(reply.rebuilt, true);
+  assert.deepEqual(reply.errors ?? [], []);
+  for (const index of [0, 999, 1_000, 2_000, 2_499]) {
+    const found = await step(`custom large: ${words[index]}`, { type: "hd_lookup", text: words[index] });
+    assert.ok(found.results.some((result) => result.term.expression === words[index]
+      && JSON.stringify(result.term.glossaries).includes(`meaning ${index}`)), `${words[index]} in its bank`);
+  }
   for (const message of [{ baseDocumentRevision: -1, text: "" }, { baseDocumentRevision: 1.5, text: "" }, { baseDocumentRevision: 0 }]) {
     reply = await step(`custom invalid ${JSON.stringify(message)}`, { type: "hd_custom_save", ...message });
     assert.equal(reply.ok, false);

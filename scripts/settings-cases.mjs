@@ -87,6 +87,20 @@ function button() {
   return value;
 }
 
+function userScript() {
+  if (chance(0.1)) return junk();
+  const value = {};
+  if (chance(0.9)) value.id = pick(["s1", "s2", "", "x".repeat(257), "a\u0001", 7]);
+  if (chance(0.9)) value.name = pick(["Jimaku Player", " ", "", "a\u0007b", 4]);
+  if (chance(0.9)) value.enabled = pick([true, false, "yes"]);
+  if (chance(0.9)) value.javascript = pick(["", "console.log(1)", "  ", 3]);
+  if (chance(0.9)) value.css = pick(["", "body { color: red }", null]);
+  if (chance(0.3)) value.store = pick([{ slug: "jimaku", version: "1.0.0" }, { slug: "", version: "1" }, { slug: "x" },
+    { slug: "x", version: "2", extra: 1 }, "x", null]);
+  if (chance(0.1)) value.extra = 1;
+  return value;
+}
+
 function fieldTemplates() {
   return pick([null, undefined, {}, { Front: { value: "{expression}", overwriteMode: "coalesce" } },
     { Front: { value: 3, overwriteMode: "coalesce" } }, { "": { value: "x", overwriteMode: "skip" } },
@@ -154,7 +168,10 @@ function value(key) {
   switch (key) {
     case "lookupMode": return pick([...options.LOOKUP_MODES, "x"]);
     case "definitionLookupMode": return pick([...options.DEFINITION_LOOKUP_MODES, "y"]);
-    case "activationKey": return pick(["Shift", "shift", "a", " ", "F12", "MouseBack", "mouseforward", "Nope", "ß"]);
+    case "activationKey": return pick(["Shift", "shift", "a", " ", "F12", "MouseBack", "mouseforward", "Nope", "ß", "MouseRight",
+      "mouseright", "", "KeyQ"]);
+    case "videoAudioFormat": return pick(["mp3", "opus", "wav"]);
+    case "videoImageFormat": return pick(["gif", "webp", "avif", "png"]);
     case "popupTheme": return pick(["default", "crystal", "nord", "auto", "missing"]);
     case "popupThemeVariant": return pick(["auto", "grey", "blue", "red"]);
     case "popupToolbarPosition": return pick(["auto", "top", "bottom", "left"]);
@@ -169,11 +186,14 @@ function value(key) {
       : Array.from({ length: Math.floor(random() * 4) }, link);
     case "customButtons": return chance(0.3) ? clone(options.normaliseCustomButtons([button(), button(), button()]))
       : Array.from({ length: Math.floor(random() * 4) }, button);
+    case "userScripts": return chance(0.3) ? clone(options.normaliseUserScripts([userScript(), userScript(), userScript()]))
+      : Array.from({ length: Math.floor(random() * 4) }, userScript);
     case "keybinds": return chance(0.3) ? clone(options.normaliseOptions({ keybinds: [keybind(), keybind()] }).keybinds)
       : Array.from({ length: Math.floor(random() * 4) }, keybind);
     case "anki": return anki();
-    case "experimental": return chance(0.5) ? clone(options.normaliseExperimental({ googleDocs: chance(0.5) }))
-      : { googleDocs: pick([true, "x"]), ...(chance(0.5) ? { netflixMining: true } : {}), ...(chance(0.2) ? { bogus: true } : {}),
+    case "experimental": return chance(0.5) ? clone(options.normaliseExperimental({ crunchyrollMining: chance(0.5) }))
+      : { googleDocs: pick([true, "x"]), ...(chance(0.5) ? { netflixMining: true } : {}), ...(chance(0.3) ? { crunchyrollMining: pick([true, 1]) } : {}),
+        ...(chance(0.2) ? { bogus: true } : {}), ...(chance(0.2) ? { youtubeMining: true } : {}),
         ...(chance(0.3) ? { smallerAnkiCards: pick([true, false]) } : {}) };
     default: return pick(["", "JMdict", "Freq", "body { color: red }", 3, null]);
   }
@@ -189,6 +209,7 @@ function optionsObject(size) {
   if (chance(0.08)) result.modifier = pick(["none", "shift", "ctrl", "alt", "meta", 1]);
   if (chance(0.08)) result.definitionBlurEnabled = pick([true, false, "x"]);
   if (chance(0.05)) result.hoverDelayMs = 100;
+  if (chance(0.08)) result.customPopupJavascript = pick(["console.log(1)", "  ", "", 3]);
   if (chance(0.05)) result.revision = pick([0, 3, -1, 2.5]);
   if (chance(0.05)) result.notAnOption = 1;
   return result;

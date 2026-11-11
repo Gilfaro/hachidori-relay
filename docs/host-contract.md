@@ -4,7 +4,7 @@
 
 > **This Rust reimplementation.** The contract is unchanged, with two differences
 > in what the relay reports. It reports its own version: `hello.version` is
-> `hachidori-relay/<crate version>` (0.3.0 now), and `/serverVersion` answers that
+> `hachidori-relay/<crate version>` (0.4.0 now), and `/serverVersion` answers that
 > crate version, where the text below says `0.0.6`. Replies are compact JSON: same
 > meaning, different spacing. Vendored from bee-san/hachidori-anki at e614794. The
 > fake host mentioned below lives in `tests/conformance/fake-host.mjs` here.
@@ -269,8 +269,12 @@ renders. `type` is `term` or `kanji` and `icon` is Yomitan's add-button icon.
 Nothing else leaves the host: no AnkiConnect address or key, tags or duplicate
 settings.
 
-The relay forwards `profileIndex` only when the body gives a number; without
-one the host answers its active profile, as Yomitan reads anything else. A host
+The relay forwards `profileIndex` only when the body gives a number, on
+`/termEntries`, `/kanjiEntries`, `/ankiFields`, `/ankiCardFormats` and
+`/tokenize` alike; without one the host answers its active profile, as Yomitan
+reads anything else. With language profiles, index 0 is the Japanese profile
+and later indexes the other profiles in order (Hachidori's docs/languages.md
+12). A host
 answers `{error}` for an index it does not have, with Yomitan's message:
 `Invalid input for ankiCardFormats, expected "profileIndex" to be a valid profile index but got 1`.
 The HTTP answer is `cardFormats`, a bare array as Yomitan answers.

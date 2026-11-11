@@ -36,10 +36,24 @@ type Result<T> = std::result::Result<T, String>;
 
 /// One upload request, as `allowLinkedImportRequest` rebuilds it.
 pub(crate) enum Request {
-    Begin { file_name: String, size: u64, replace: bool },
-    Chunk { token: String, offset: Value, data: String },
-    Commit { token: String },
-    Abort { token: String },
+    /// `profile_id` is the profile the import joins (`selectedProfileId`).
+    Begin {
+        file_name: String,
+        size: u64,
+        replace: bool,
+        profile_id: Option<String>,
+    },
+    Chunk {
+        token: String,
+        offset: Value,
+        data: String,
+    },
+    Commit {
+        token: String,
+    },
+    Abort {
+        token: String,
+    },
 }
 
 /// `requestIdOf`: a string or finite number, or `null`.
@@ -70,7 +84,9 @@ pub(crate) fn allow(message: &Value) -> Result<Request> {
                 (Some(file_name), Some(size), Some(replace)) => {
                     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "a safe integer, at most 2^53 - 1")]
                     let size = if size > 0.0 { size as u64 } else { 0 };
-                    Ok(Request::Begin { file_name: file_name.to_owned(), size, replace })
+                    // The import joins the profile it names (docs/languages.md 5.2).
+                    let profile_id = super::anki::selected_profile_id(message)?.and_then(|id| id.as_str().map(str::to_owned));
+                    Ok(Request::Begin { file_name: file_name.to_owned(), size, replace, profile_id })
                 }
                 _ => Err("malformed dictionary upload request".to_owned()),
             }
@@ -123,6 +139,7 @@ struct Session {
     file_name: String,
     size: u64,
     replace: bool,
+    profile_id: Option<String>,
     received: u64,
     busy: bool,
     file: PathBuf,
@@ -135,6 +152,7 @@ pub(crate) struct Complete {
     pub(crate) file: PathBuf,
     pub(crate) file_name: String,
     pub(crate) replace: bool,
+    pub(crate) profile_id: Option<String>,
 }
 
 impl Drop for Complete {
@@ -191,7 +209,14 @@ impl Uploads {
     }
 
     /// `begin`: `{token, chunkBytes}`.
-    pub(crate) fn begin(self: &Arc<Self>, owner: &Arc<str>, file_name: &str, size: u64, replace: bool) -> Result<Value> {
+    pub(crate) fn begin(
+        self: &Arc<Self>,
+        owner: &Arc<str>,
+        file_name: &str,
+        size: u64,
+        replace: bool,
+        profile_id: Option<String>,
+    ) -> Result<Value> {
         if file_name.is_empty() || file_name == "." || file_name == ".." || file_name.contains(['/', '\\', '\0']) {
             return Err("The dictionary upload has no usable file name.".to_owned());
         }
@@ -212,6 +237,7 @@ impl Uploads {
             file_name: file_name.to_owned(),
             size,
             replace,
+            profile_id,
             received: 0,
             busy: false,
             file,
@@ -296,7 +322,7 @@ impl Uploads {
         }
         let session = sessions.remove(token).ok_or_else(|| NOT_OPEN.to_owned())?;
         drop(sessions);
-        Ok(Complete { file: session.file, file_name: session.file_name, replace: session.replace })
+        Ok(Complete { file: session.file, file_name: session.file_name, replace: session.replace, profile_id: session.profile_id })
     }
 
     /// `abort`: drops `owner`'s upload `token`, if it is open.
@@ -327,6 +353,13 @@ mod tests {
         let begin = allow(&json!({ "type": "hd_import_begin", "fileName": "a.zip", "size": 3, "replace": false }));
         assert!(matches!(begin, Ok(Request::Begin { size: 3, replace: false, .. })));
         assert!(allow(&json!({ "type": "hd_import_begin", "fileName": "a.zip", "size": 1.5, "replace": false })).is_err());
+        let named = allow(&json!({ "type": "hd_import_begin", "fileName": "a.zip", "size": 3, "replace": false, "profileId": "en" }));
+        assert!(matches!(named, Ok(Request::Begin { profile_id: Some(id), .. }) if id == "en"));
+        for profile in [json!(""), json!(3), json!("a")] {
+            let begin =
+                allow(&json!({ "type": "hd_import_begin", "fileName": "a.zip", "size": 3, "replace": false, "profileId": profile }));
+            assert_eq!(begin.err().as_deref(), Some("malformed linked profile"));
+        }
         assert!(allow(&json!({ "type": "hd_import_chunk", "token": "a/b", "offset": 0, "data": "" })).is_err());
         assert_eq!(allow(&json!({ "type": "hd_import_x" })).err().as_deref(), Some("unsupported dictionary upload request"));
         assert_eq!(request_id(&json!({ "requestId": {} })), Value::Null);
@@ -341,22 +374,58 @@ mod tests {
         assert!(decoded_length("YQ=").is_err() && decoded_length("Y===").is_err() && decoded_length("YW=j").is_err());
     }
 
+    /// Upstream's linked-import.test.mjs "abort, the idle timeout and a
+    /// disconnect drop held uploads".
+    #[tokio::test(start_paused = true)]
+    async fn abort_the_idle_timeout_and_a_disconnect_drop_held_uploads() {
+        let dir = std::env::temp_dir().join(format!("hachidori-relay-test-upload-idle-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let uploads = Uploads::new(Arc::new(Store::open(&dir).unwrap_or_else(|error| panic!("{error}"))));
+        let (a, b, local): (Arc<str>, Arc<str>, Arc<str>) = (Arc::from("remote:a"), Arc::from("remote:b"), Arc::from("local"));
+        let begin = |owner: &Arc<str>, name: &str| {
+            uploads.begin(owner, name, 4, true, None).unwrap_or_else(|error| panic!("{error}"))["token"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned()
+        };
+        let aborted = begin(&a, "a.zip");
+        assert_eq!(uploads.abort("remote:a", &aborted), json!({}));
+        assert!(uploads.chunk("remote:a", &aborted, &json!(0), "YWJj").is_err());
+
+        // A chunk renews the wait; silence for the whole of it drops the upload.
+        let idle = begin(&a, "b.zip");
+        tokio::time::sleep(IDLE.saturating_sub(Duration::from_secs(1))).await;
+        assert_eq!(uploads.chunk("remote:a", &idle, &json!(0), "YQ==").ok(), Some(json!({ "received": 1 })));
+        tokio::time::sleep(IDLE.saturating_sub(Duration::from_secs(1))).await;
+        assert_eq!(uploads.chunk("remote:a", &idle, &json!(1), "Yg==").ok(), Some(json!({ "received": 2 })));
+        tokio::time::sleep(IDLE + Duration::from_secs(1)).await;
+        assert_eq!(uploads.chunk("remote:a", &idle, &json!(2), "Yw==").err().as_deref(), Some(NOT_OPEN));
+
+        let gone = begin(&b, "c.zip");
+        let kept = begin(&local, "d.zip");
+        uploads.drop_owner("remote:b");
+        assert!(uploads.chunk("remote:b", &gone, &json!(0), "YQ==").is_err());
+        assert_eq!(uploads.lock().len(), 1);
+        assert!(uploads.lock().contains_key(&kept));
+        let _ = fs::remove_dir_all(dir);
+    }
+
     #[tokio::test]
     async fn an_upload_arrives_in_order_and_belongs_to_its_sender() {
         let dir = std::env::temp_dir().join(format!("hachidori-relay-test-upload-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let uploads = Uploads::new(Arc::new(Store::open(&dir).unwrap_or_else(|error| panic!("{error}"))));
         let owner: Arc<str> = Arc::from("one");
-        assert!(uploads.begin(&owner, "a.mdx", 3, false).is_err());
-        assert!(uploads.begin(&owner, "a.zip", 0, false).is_err());
-        let begun = uploads.begin(&owner, "a.zip", 3, false).unwrap_or_else(|error| panic!("{error}"));
+        assert!(uploads.begin(&owner, "a.mdx", 3, false, None).is_err());
+        assert!(uploads.begin(&owner, "a.zip", 0, false, None).is_err());
+        let begun = uploads.begin(&owner, "a.zip", 3, false, None).unwrap_or_else(|error| panic!("{error}"));
         let token = begun["token"].as_str().unwrap_or_default().to_owned();
         assert!(uploads.chunk("two", &token, &json!(0), "YWI=").is_err(), "another browser's upload");
         assert_eq!(uploads.chunk("one", &token, &json!(0), "YWI=").ok(), Some(json!({ "received": 2 })));
         assert!(uploads.commit("one", &token).is_err(), "one byte is missing");
         assert!(uploads.chunk("one", &token, &json!(2), "Yw==").is_err(), "the failed commit dropped it");
 
-        let token = uploads.begin(&owner, "a.zip", 3, true).unwrap_or_else(|error| panic!("{error}"))["token"]
+        let token = uploads.begin(&owner, "a.zip", 3, true, None).unwrap_or_else(|error| panic!("{error}"))["token"]
             .as_str()
             .unwrap_or_default()
             .to_owned();

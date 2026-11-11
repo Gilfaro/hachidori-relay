@@ -148,9 +148,16 @@ impl<S: Storage> Updates<S> {
             let index = dictionaries.iter().position(|dictionary| strict_eq(dictionary.get("id"), fingerprint.get("id")));
             let Some(index) = index.filter(|&index| remote::matches(Some(&dictionaries[index]), fingerprint)) else { return Ok(None) };
             dictionaries[index]["lastUpdateCheck"] = last;
-            let message = json!({ "type": "hd_state_cas", "baseRevision": state.get("revision").cloned().unwrap_or(Value::Null),
-                "dictionaries": dictionaries });
-            let reply = worker::handle(&self.storage, &message, &[]);
+            let base = state.get("revision").cloned().unwrap_or(Value::Null);
+            // A check result is package-wide: with profiles it is written into the
+            // package list, every profile's list unchanged (docs/languages.md 4.2).
+            let message = if state.get("schemaVersion") == Some(&json!(2)) {
+                json!({ "type": "hd_state_cas", "baseRevision": base, "state": { "dictionaries": dictionaries, "profiles": state.get("profiles") } })
+            } else {
+                json!({ "type": "hd_state_cas", "baseRevision": base, "dictionaries": dictionaries })
+            };
+            // The host's own write, as the extension's background calls its handler.
+            let reply = worker::handle_from(&self.storage, &message, &[], worker::Sender::Engine);
             if reply.get("ok") == Some(&Value::Bool(false)) {
                 let error = reply.get("error").and_then(Value::as_str).filter(|error| !error.is_empty());
                 return Err(error.unwrap_or("the dictionary update state could not be saved").to_owned());
@@ -196,9 +203,11 @@ impl<S: Storage> Updates<S> {
             return Err("update index redirected to a non-HTTPS URL".to_owned());
         }
         let mut body = Vec::new();
-        response.body.take(MAX_INDEX_BYTES + 1).read_to_end(&mut body).map_err(|error| {
-            timed_out(if error.kind() == std::io::ErrorKind::TimedOut { TIMED_OUT.to_owned() } else { FAILED_TO_FETCH.to_owned() })
-        })?;
+        response
+            .body
+            .take(MAX_INDEX_BYTES + 1)
+            .read_to_end(&mut body)
+            .map_err(|error| timed_out(if remote::read_timed_out(&error) { TIMED_OUT.to_owned() } else { FAILED_TO_FETCH.to_owned() }))?;
         if body.len() as u64 > MAX_INDEX_BYTES {
             return Err(format!("update index exceeds the {} MiB the Hachidori relay reads", MAX_INDEX_BYTES >> 20));
         }
@@ -259,7 +268,7 @@ impl<S: Storage> Updates<S> {
             "checkedAt": checked_at,
             "fileName": candidate.title,
         });
-        let reply = self.engine.import_remote(&self.storage, &self.lock, self.fetch.as_ref(), &message);
+        let reply = self.engine.import_remote(&self.storage, &self.lock, self.fetch.as_ref(), &message, &|_| {});
         if reply["ok"] == true && reply["report"]["success"] == true {
             return Ok(());
         }
@@ -380,7 +389,27 @@ pub(crate) mod tests {
     impl Fetch for Served {
         fn get(&self, url: &str, _idle: Option<Duration>) -> Result<Fetched> {
             let served = self.0.lock().unwrap().get(url).cloned().ok_or_else(|| FAILED_TO_FETCH.to_owned())?;
-            Ok(Fetched { status: served.0, url: served.1, body: Box::new(Cursor::new(served.2)) })
+            match served.2.as_slice() {
+                STALLED_HEADERS => Err(TIMED_OUT.to_owned()),
+                STALLED_BODY => Ok(Fetched { status: served.0, url: served.1, total: None, body: Box::new(Stalled) }),
+                _ => {
+                    let total = u64::try_from(served.2.len()).ok().filter(|length| *length > 0);
+                    Ok(Fetched { status: served.0, url: served.1, total, body: Box::new(Cursor::new(served.2)) })
+                }
+            }
+        }
+    }
+
+    /// A served body that stands for a response whose headers never arrive.
+    pub(crate) const STALLED_HEADERS: &[u8] = b"(stalled headers)";
+    /// A served body that stands for one that goes quiet for its idle time.
+    pub(crate) const STALLED_BODY: &[u8] = b"(stalled body)";
+
+    struct Stalled;
+
+    impl Read for Stalled {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "timeout: per read"))
         }
     }
 
@@ -400,6 +429,10 @@ pub(crate) mod tests {
     static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
     fn service(dictionaries: &Value, served: Served) -> Updates<Memory> {
+        shared_service(dictionaries, Arc::new(served))
+    }
+
+    fn shared_service(dictionaries: &Value, served: Arc<Served>) -> Updates<Memory> {
         let storage = Memory(Mutex::new(json_map(
             json!({ "dictionaryState": { "schemaVersion": 1, "revision": 3, "dictionaries": dictionaries, "groups": [] } }),
         )));
@@ -407,7 +440,7 @@ pub(crate) mod tests {
             store::Store::open(store::tests::scratch(&format!("updates-{}", NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))))
                 .unwrap(),
         );
-        Updates::new(storage, Arc::default(), Arc::new(Engine::new(store)), Arc::new(served))
+        Updates::new(storage, Arc::default(), Arc::new(Engine::new(store)), served)
     }
 
     fn managed(id: &str, revision: &str) -> Value {
@@ -449,6 +482,50 @@ pub(crate) mod tests {
         assert_eq!(stored[1]["lastUpdateCheck"]["remoteRevision"], "2");
         assert_eq!(stored[2]["lastUpdateCheck"]["error"], "update index request failed with HTTP 404");
         assert!(stored[3].get("lastUpdateCheck").is_none());
+    }
+
+    // A check result is package-wide: with profiles it lands in the package
+    // list and every profile's list stays as it was.
+    #[test]
+    fn a_check_on_records_with_profiles_keeps_every_profile() {
+        let served = Served::default();
+        index(&served, "jitendex", 200, r#"{"revision":"2"}"#);
+        let updates = service(&json!([]), served);
+        let mut records = crate::host::settings::profile_worker::tests::profile_records();
+        let mut row = json_map(managed("jitendex", "1"));
+        row.remove("enabled");
+        row.insert("path".to_owned(), json!("/dicts/b"));
+        records["dictionaryState"]["dictionaries"][1] = Value::Object(row);
+        let profiles = records["dictionaryState"]["profiles"].clone();
+        updates.storage.0.lock().unwrap().extend(json_map(records));
+        let reply = updates.handle(&json!({ "type": "hd_updates_check", "requestId": "q" }));
+        assert_eq!(reply["outcomes"], json!([{ "id": "jitendex", "status": "update-available" }]), "{reply}");
+        let state = updates.storage.read(store::DICTIONARY_STATE).unwrap();
+        assert_eq!(state["schemaVersion"], 2);
+        assert_eq!(state["dictionaries"][1]["lastUpdateCheck"]["remoteRevision"], "2");
+        assert_eq!(state["profiles"], profiles);
+    }
+
+    // The extension's "a stalled update headers/body times out, permits sibling
+    // checks and retry": the quiet index fails with its wording, the next is
+    // still checked, and a retry checks both.
+    #[test]
+    fn a_stalled_index_times_out_and_the_next_is_still_checked() {
+        for stalled in [STALLED_HEADERS, STALLED_BODY] {
+            let served = Arc::new(Served::default());
+            index(&served, "a", 200, std::str::from_utf8(stalled).unwrap());
+            index(&served, "b", 200, r#"{"revision":"2"}"#);
+            let updates = shared_service(&json!([managed("a", "1"), managed("b", "1")]), Arc::clone(&served));
+            let check = || updates.handle(&json!({ "type": "hd_updates_check", "requestId": "q" }));
+            let first = check();
+            assert_eq!(first["outcomes"][0]["status"], "check-failed");
+            assert_eq!(first["outcomes"][0]["error"], "Dictionary update check received no data for two minutes. Try checking again.");
+            assert_eq!(first["outcomes"][1]["status"], "update-available");
+            index(&served, "a", 200, r#"{"revision":"2"}"#);
+            let retry = check();
+            assert_eq!(retry["outcomes"][0]["status"], "update-available");
+            assert_eq!(retry["outcomes"][1]["status"], "update-available");
+        }
     }
 
     #[test]
@@ -502,6 +579,50 @@ pub(crate) mod tests {
         // The next check finds it up to date.
         let again = updates.handle(&json!({ "type": "hd_updates_check", "requestId": "q" }));
         assert_eq!(again["outcomes"], json!([{ "id": "a", "status": "up-to-date" }]));
+    }
+
+    /// `runManagedUpdateCycle` from the update alarm: only what its schedule makes
+    /// due is checked and installed, disabled packages included, and a run with
+    /// nothing due changes nothing.
+    #[test]
+    fn a_scheduled_cycle_runs_only_what_is_due() {
+        let served = Served::default();
+        for id in ["due", "recent", "off", "disabled"] {
+            index(&served, id, 200, r#"{"revision":"1"}"#);
+        }
+        let checked = |minutes_ago: f64| json!({ "checkedAt": js::iso_time(js::now() - minutes_ago * 60_000.0), "status": "up-to-date" });
+        let mut recent = managed("recent", "1");
+        recent["lastUpdateCheck"] = checked(5.0);
+        let mut due = managed("due", "1");
+        due["lastUpdateCheck"] = checked(25.0 * 60.0);
+        let mut off = managed("off", "1");
+        off["updateScheduleOverride"] = json!("off");
+        let mut disabled = managed("disabled", "1");
+        disabled["enabled"] = json!(false);
+        disabled["updateScheduleOverride"] = json!("hourly");
+        let updates = service(&json!([due, recent, off, disabled]), served);
+
+        // Global Off: only the hourly override is due.
+        assert!(updates.anything_due());
+        let ran = updates.cycle(None, true, true);
+        assert_eq!(ran["outcomes"], json!([{ "id": "disabled", "status": "up-to-date" }]), "{ran:?}");
+        assert!(!updates.anything_due(), "a checked package waits for its next interval");
+        let idle = updates.cycle(None, true, true);
+        assert_eq!(idle["outcomes"], json!([]));
+        assert_eq!(idle["settings"], ran["settings"], "a run with nothing due writes nothing");
+
+        // Daily: the package checked a day ago is due, the one checked minutes ago is not.
+        let set = updates.handle(
+            &json!({ "type": "hd_updates_schedule", "requestId": "s", "baseRevision": idle["settings"]["revision"], "schedule": "daily" }),
+        );
+        assert_eq!(set["ok"], true, "{set}");
+        assert!(updates.anything_due());
+        let ran = updates.cycle(None, true, true);
+        assert_eq!(ran["outcomes"], json!([{ "id": "due", "status": "up-to-date" }]), "{ran:?}");
+        assert!(ran["settings"]["lastCheckedAt"].is_string());
+        assert!(!updates.anything_due());
+        let stored = updates.dictionaries();
+        assert_eq!(stored[2].get("lastUpdateCheck"), Some(&Value::Null), "a package set Off is never checked");
     }
 
     #[test]

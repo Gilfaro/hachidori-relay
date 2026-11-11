@@ -10,6 +10,7 @@ use serde_json::{Map, Value};
 use super::duplicates::Fields;
 use super::gateway::{Failure, Result};
 use super::glossary::{Wanted, definition_tags, tag_list};
+use super::language::{NoteLanguage, has_rtl_text};
 use super::templates::{escape_html, marker_names, render};
 use crate::host::js;
 use crate::host::lookup::furigana::{Piece, matched_furigana, term_furigana};
@@ -197,21 +198,30 @@ fn frequency_aggregate(term: &Value, mode: &str, harmonic: bool) -> String {
     }
 }
 
-fn frequency_html(request: &Value, groups: &[&Value]) -> String {
+/// `frequencyHtml`: under the right-to-left rules of docs/languages.md 12 the
+/// list aligns to its start and a name with a right-to-left character sits in
+/// its own element.
+fn frequency_html(request: &Value, groups: &[&Value], rtl_rules: bool) -> String {
     let items: Vec<String> = groups
         .iter()
         .flat_map(|group| {
-            let dictionary = escape_html(&alias(request, &js::to_string(group.get("dictionary"))));
+            let name = alias(request, &js::to_string(group.get("dictionary")));
+            let dictionary = if rtl_rules && has_rtl_text(&name) {
+                format!("<span dir=\"auto\">{}</span>", escape_html(&name))
+            } else {
+                escape_html(&name)
+            };
             array(group.get("frequencies")).iter().map(move |value| {
                 let shown = value.get("displayValue").filter(|shown| !shown.is_null()).or_else(|| value.get("value"));
                 format!("<li>{dictionary}: {}</li>", escape(shown))
             })
         })
         .collect();
-    if items.is_empty() { String::new() } else { format!("<ul style=\"text-align: left;\">{}</ul>", items.concat()) }
+    let align = if rtl_rules { "start" } else { "left" };
+    if items.is_empty() { String::new() } else { format!("<ul style=\"text-align: {align};\">{}</ul>", items.concat()) }
 }
 
-fn single_frequency(request: &Value, dictionary: &str, numeric: bool) -> String {
+fn single_frequency(request: &Value, dictionary: &str, numeric: bool, rtl_rules: bool) -> String {
     let groups: Vec<&Value> = array(request["term"].get("frequencies"))
         .iter()
         .filter(|group| text(group.get("dictionary")) == dictionary && !array(group.get("frequencies")).is_empty())
@@ -220,7 +230,7 @@ fn single_frequency(request: &Value, dictionary: &str, numeric: bool) -> String 
         let value = groups.first().map_or_else(|| js::number(0.0), |group| frequency_number(&group["frequencies"][0]));
         return if js::to_number(Some(&value)) > 0.0 { js::to_string(Some(&value)) } else { String::new() };
     }
-    frequency_html(request, &groups)
+    frequency_html(request, &groups, rtl_rules)
 }
 
 // --- Pitch accent ---
@@ -678,6 +688,9 @@ struct Builder<'a, 'b> {
     glossaries: Option<HashMap<String, Wanted>>,
     frequencies: Option<HashMap<String, (String, bool)>>,
     values: HashMap<String, String>,
+    /// The language of the profile the note is mined in; without one every
+    /// value is today's.
+    language: Option<&'a NoteLanguage>,
 }
 
 impl Builder<'_, '_> {
@@ -720,6 +733,33 @@ impl Builder<'_, '_> {
     fn sentence(&self) -> String {
         let [prefix, body, suffix] = self.parts();
         format!("{prefix}<b>{body}</b>{suffix}")
+    }
+
+    /// A note mined in a right-to-left profile follows the right-to-left rules.
+    fn rtl_rules(&self) -> bool {
+        self.language.is_some_and(|language| language.direction == "rtl")
+    }
+
+    /// The sentence keeps its own direction in any card; the cloze parts stay
+    /// bare, because isolating each one would break the sentence's order.
+    fn isolated_sentence(&self) -> String {
+        if self.rtl_rules() { format!("<span dir=\"auto\">{}</span>", self.sentence()) } else { self.sentence() }
+    }
+
+    /// Without ruby the furigana markers give the plain headword.
+    fn ruby(&self) -> bool {
+        self.language.is_none_or(|language| language.ruby)
+    }
+
+    /// `partOfSpeechLabels`: a language's tags with its pack's labels; the
+    /// Japanese pack carries the table above.
+    fn part_of_speech(&self, tag: &str) -> String {
+        let label = match self.language.map(|language| (language.part_of_speech_labels(), language.is_japanese())) {
+            None | Some((None, true)) => PARTS_OF_SPEECH.iter().find(|(key, _)| *key == tag).map(|(_, label)| (*label).to_owned()),
+            Some((Some(labels), _)) => labels.get(tag).map(|label| js::to_string(Some(label))),
+            Some((None, false)) => None,
+        };
+        escape_html(label.as_deref().unwrap_or(tag))
     }
 
     fn sentence_furigana(&self, plain: bool) -> String {
@@ -797,6 +837,8 @@ impl Builder<'_, '_> {
                     .filter(|value| !value.is_null());
                 value.map_or_else(String::new, |value| escape(Some(value)))
             }
+            // Without ruby the furigana markers give the plain headword.
+            "furigana" | "furigana-plain" if !self.ruby() => escape(term.get("expression")),
             "furigana" => furigana_html(&term_furigana(term), false),
             "furigana-plain" => furigana_html(&term_furigana(term), true),
             "dictionary" => escape_html(&self.first_dictionary()),
@@ -818,11 +860,7 @@ impl Builder<'_, '_> {
                 let tags = unique_tokens(
                     std::iter::once(text(term.get("rules"))).chain(glossaries.iter().map(|glossary| text(glossary.get("termTags")))),
                 );
-                let joined = tags
-                    .iter()
-                    .map(|tag| escape_html(PARTS_OF_SPEECH.iter().find(|(key, _)| key == tag).map_or(tag.as_str(), |(_, label)| label)))
-                    .collect::<Vec<_>>()
-                    .join(", ");
+                let joined = tags.iter().map(|tag| self.part_of_speech(tag)).collect::<Vec<_>>().join(", ");
                 if joined.is_empty() { "Unknown".to_owned() } else { joined }
             }
             "tags" => {
@@ -860,18 +898,20 @@ impl Builder<'_, '_> {
             "popup-selection-text" => escape(request.get("popupSelectionText")).replace('\n', "<br>\n"),
             "search-query" => escape(request.get("searchQuery")),
             "document-title" => escape(request.get("documentTitle")),
+            // A video's title and channel or episode, else the page title.
+            "miscinfo" => escape(request.get("miscInfo").filter(|info| js::truthy(Some(info))).or_else(|| request.get("documentTitle"))),
             "url" => {
                 let address = self.page_url();
                 if address.is_empty() { address } else { format!("<a href=\"{address}\">{address}</a>") }
             }
             "url-plain" => self.page_url(),
-            "sentence" => self.sentence(),
+            "sentence" => self.isolated_sentence(),
             "sentence-furigana" => self.sentence_furigana(false),
             "sentence-furigana-plain" => self.sentence_furigana(true),
             "cloze-prefix" => self.parts()[0].clone(),
             "cloze-body" => self.parts()[1].clone(),
             "cloze-suffix" => self.parts()[2].clone(),
-            "frequencies" => frequency_html(request, &array(term.get("frequencies")).iter().collect::<Vec<_>>()),
+            "frequencies" => frequency_html(request, &array(term.get("frequencies")).iter().collect::<Vec<_>>(), self.rtl_rules()),
             "frequency-harmonic-rank" => frequency_aggregate(term, "rank-based", true),
             "frequency-harmonic-occurrence" => frequency_aggregate(term, "occurrence-based", true),
             "frequency-average-rank" => frequency_aggregate(term, "rank-based", false),
@@ -927,7 +967,7 @@ impl Builder<'_, '_> {
             None if name.starts_with("single-frequency-") => {
                 let frequencies = self.frequencies.get_or_insert_with(|| dynamic_frequencies(self.request));
                 match frequencies.get(name).cloned() {
-                    Some((dictionary, numeric)) => single_frequency(self.request, &dictionary, numeric),
+                    Some((dictionary, numeric)) => single_frequency(self.request, &dictionary, numeric, self.rtl_rules()),
                     None => String::new(),
                 }
             }
@@ -938,13 +978,14 @@ impl Builder<'_, '_> {
     }
 }
 
-/// `buildAnkiFields(request, templates, {definition, audio})`: each field's rendered
-/// Template, in the note type's order.
+/// `buildAnkiFields(request, templates, {definition, audio, language})`: each
+/// field's rendered Template, in the note type's order.
 pub(crate) fn build_fields(
     request: &Value,
     templates: &[(String, Map<String, Value>)],
     definition: &mut Definition<'_>,
     audio: &str,
+    language: Option<&NoteLanguage>,
 ) -> Result<Fields> {
     let planned: Vec<(&str, &str, Vec<String>)> = templates
         .iter()
@@ -971,6 +1012,7 @@ pub(crate) fn build_fields(
         glossaries: None,
         frequencies: None,
         values: HashMap::new(),
+        language,
     };
     let mut fields = Vec::with_capacity(planned.len());
     for (field, template, names) in planned {
@@ -996,7 +1038,7 @@ mod tests {
             .map(|(field, value)| ((*field).to_owned(), json!({ "value": value }).as_object().cloned().unwrap_or_default()))
             .collect();
         let mut definition = |wanted: &Wanted| Ok(format!("[{wanted:?}]"));
-        build_fields(request, &templates, &mut definition, "").unwrap()
+        build_fields(request, &templates, &mut definition, "", None).unwrap()
     }
 
     #[test]

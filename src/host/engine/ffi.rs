@@ -8,6 +8,7 @@
 
 #![allow(unsafe_code, reason = "the one FFI module")]
 
+use std::collections::BTreeSet;
 use std::ffi::{CStr, CString, c_char, c_int};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
@@ -30,6 +31,12 @@ mod sys {
         ) -> *const c_char;
         pub(super) fn hdw_segment(text: *const c_char, scan_length: c_int, options: *const c_char) -> *const c_char;
         pub(super) fn hdw_kanji(character: *const c_char) -> *const c_char;
+        pub(super) fn hdw_kanji_with_options(character: *const c_char, options: *const c_char) -> *const c_char;
+        pub(super) fn hdw_language_load(language: *const c_char, transforms: *const c_char) -> c_int;
+        #[cfg_attr(not(test), expect(dead_code, reason = "the extension's engine never calls it; the ported language smoke test does"))]
+        pub(super) fn hdw_languages() -> *const c_char;
+        #[cfg_attr(not(test), expect(dead_code, reason = "the extension's engine never calls it; the ported language smoke test does"))]
+        pub(super) fn hdw_deinflect(text: *const c_char, code: *const c_char) -> *const c_char;
         pub(super) fn hdw_styles() -> *const c_char;
         pub(super) fn hdw_tags() -> *const c_char;
         pub(super) fn hdw_media(dictionary: *const c_char, path: *const c_char) -> c_int;
@@ -53,12 +60,14 @@ pub(crate) enum Kind {
 pub(crate) type Failure = String;
 
 /// The lock on the one native engine. `owner` says whose dictionaries it holds,
-/// so two hosts in one process (tests) each reload their own set.
+/// so two hosts in one process (tests) each reload their own set; `languages`
+/// are the shipped packs loaded into it, which no reset unloads.
 pub(crate) struct Native {
     pub(crate) owner: Option<(u64, u64)>,
+    pub(crate) languages: BTreeSet<String>,
 }
 
-static ENGINE: Mutex<Native> = Mutex::new(Native { owner: None });
+static ENGINE: Mutex<Native> = Mutex::new(Native { owner: None, languages: BTreeSet::new() });
 
 /// A C string from text the caller has already checked for NUL; an interior NUL
 /// becomes an empty string, which every native call treats as "nothing".
@@ -164,6 +173,38 @@ impl Native {
         let character = c(character);
         // SAFETY: a valid C string for the duration of the call.
         self.checked(owned(unsafe { sys::hdw_kanji(character.as_ptr()) }))
+    }
+
+    /// `hdw_kanji_with_options`: `hdw_kanji` over the `dictionaries` the options name.
+    pub(crate) fn kanji_with_options(&self, character: &str, options: &str) -> Result<String, Failure> {
+        let (character, options) = (c(character), c(options));
+        // SAFETY: valid C strings for the duration of the call.
+        self.checked(owned(unsafe { sys::hdw_kanji_with_options(character.as_ptr(), options.as_ptr()) }))
+    }
+
+    /// `hdw_language_load`: adds a language pack, its `language.json` and the
+    /// transforms file it names (empty when it names none). Packs outlive [`Self::reset`].
+    #[allow(clippy::needless_pass_by_ref_mut, reason = "the engine is global; `&mut` holds its lock")]
+    pub(crate) fn language_load(&mut self, language: &str, transforms: &str) -> Result<(), Failure> {
+        let (language, transforms) = (c(language), c(transforms));
+        // SAFETY: valid C strings for the duration of the call.
+        let ok = unsafe { sys::hdw_language_load(language.as_ptr(), transforms.as_ptr()) };
+        if ok == 1 { Ok(()) } else { Err(self.error().unwrap_or_default()) }
+    }
+
+    /// `hdw_languages`: the JSON array of the loaded packs' codes, sorted.
+    #[cfg_attr(not(test), expect(dead_code, reason = "the extension's engine never calls it; the ported language smoke test does"))]
+    pub(crate) fn languages(&self) -> Result<String, Failure> {
+        // SAFETY: no arguments.
+        self.checked(owned(unsafe { sys::hdw_languages() }))
+    }
+
+    /// `hdw_deinflect`: the JSON `{input, results}` of `text`'s deinflections in `code`.
+    #[cfg_attr(not(test), expect(dead_code, reason = "the extension's engine never calls it; the ported language smoke test does"))]
+    pub(crate) fn deinflect(&self, text: &str, code: &str) -> Result<String, Failure> {
+        let (text, code) = (c(text), c(code));
+        // SAFETY: valid C strings for the duration of the call.
+        self.checked(owned(unsafe { sys::hdw_deinflect(text.as_ptr(), code.as_ptr()) }))
     }
 
     /// `hdw_styles`: the JSON array of each dictionary's styles.

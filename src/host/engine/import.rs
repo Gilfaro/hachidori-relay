@@ -12,10 +12,14 @@ use std::path::Path;
 
 use serde_json::{Map, Value, json};
 
-use super::mutations::{IMPORT_COUNTS, ImportError, Result, STORAGE_ATTEMPTS, Session, error_or, import_error, is_true, list, paths};
+use super::mutations::{
+    IMPORT_COUNTS, ImportError, Joining, Result, STORAGE_ATTEMPTS, Session, assert_profile_exists, error_or, import_error, is_true,
+    joined_ids, list, paths,
+};
 use super::{Engine, object, package, text};
 use crate::host::js::{self, strict_eq};
-use crate::host::settings::custom::CUSTOM_DICTIONARY_TITLE;
+use crate::host::profile::JAPANESE;
+use crate::host::settings::custom;
 use crate::host::settings::worker::Storage;
 use crate::host::store;
 
@@ -238,7 +242,7 @@ fn separate_title(title: &str, stored: &[Value]) -> String {
 }
 
 /// The `index.json` of the package installed in `dir`.
-fn read_index(dir: &Path) -> Result<Value> {
+pub(super) fn read_index(dir: &Path) -> Result<Value> {
     let index = fs::read_to_string(dir.join("index.json")).map_err(|error| error.to_string())?;
     serde_json::from_str(&index).map_err(|error| error.to_string())
 }
@@ -254,19 +258,21 @@ impl Engine {
         archive: &Path,
         file_name: &str,
         replace: bool,
+        profile_id: Option<&str>,
         request_id: &Value,
     ) -> Result<Value> {
         let identity = read_identity(archive)?;
         let state = storage.read(store::DICTIONARY_STATE).unwrap_or(Value::Null);
         let decision = upload_decision(&identity, list(state.get("dictionaries")), replace);
-        Ok(self.run(storage, "hd_import", request_id, |session| Ok(session.import(archive, file_name, &decision))))
+        Ok(self.run(storage, "hd_import", request_id, |session| Ok(session.import(archive, file_name, &decision, profile_id))))
     }
 }
 
 impl<S: Storage> Session<'_, S> {
     /// `hd_import` for a local archive with an interactive `decision`. Every failure is
     /// a reply: `{ok: false, error, errorCode, report}`.
-    fn import(&mut self, archive: &Path, file_name: &str, decision: &Value) -> Map<String, Value> {
+    /// `profile_id` is the profile the import is for, which the package joins.
+    fn import(&mut self, archive: &Path, file_name: &str, decision: &Value, profile_id: Option<&str>) -> Map<String, Value> {
         let fail = |error: ImportError| {
             let report = empty_report(&error.message);
             object(json!({ "ok": false, "error": error.message, "errorCode": error.code, "report": report }))
@@ -294,7 +300,7 @@ impl<S: Storage> Session<'_, S> {
             return object(json!({ "ok": false, "error": error.message, "report": report, "errorCode": error.code }));
         }
         let mut path = format!("{root}/{}", package::folder_name(text(report.get("title"))));
-        match self.commit_import(&mut path, &mut report, decision) {
+        match self.commit_import(&mut path, &mut report, decision, profile_id) {
             Ok(()) => object(json!({ "report": report })),
             Err(error) => {
                 // `rollbackImportedGeneration`.
@@ -307,7 +313,13 @@ impl<S: Storage> Session<'_, S> {
 
     /// `commitImportedGeneration` for an interactive decision. `path` follows the
     /// package when a separate copy is retitled.
-    fn commit_import(&mut self, path: &mut String, report: &mut Map<String, Value>, decision: &Value) -> Result<()> {
+    fn commit_import(
+        &mut self,
+        path: &mut String,
+        report: &mut Map<String, Value>,
+        decision: &Value,
+        profile_id: Option<&str>,
+    ) -> Result<()> {
         let title = text(report.get("title")).to_owned();
         let root = path[..path.len() - package::folder_name(&title).len() - 1].to_owned();
         let store = self.engine.store.clone();
@@ -319,12 +331,13 @@ impl<S: Storage> Session<'_, S> {
         if !same_identity(&archive_identity(&read_index(&store.dictionary_dir(path))?)?, identity) {
             return Err("the imported dictionary metadata did not match the reviewed archive".to_owned());
         }
-        if title == CUSTOM_DICTIONARY_TITLE {
-            return Err(format!("{CUSTOM_DICTIONARY_TITLE} is reserved for the managed custom dictionary"));
+        if custom::is_personal_title(&title) {
+            return Err(format!("{title} is reserved for the managed custom dictionary"));
         }
         let mut candidate_title = title;
         for attempt in 0..STORAGE_ATTEMPTS {
             let state = self.dictionary_state()?;
+            assert_profile_exists(&state, profile_id.unwrap_or(JAPANESE))?;
             let stored = list(state.get("dictionaries")).to_vec();
             let next = match decision["action"].as_str() {
                 Some("install") => {
@@ -345,8 +358,20 @@ impl<S: Storage> Session<'_, S> {
                 }
             };
             let candidate = self.preload(&next, &paths(&stored))?;
-            let base = state.get("revision").filter(|revision| !revision.is_null()).cloned().unwrap_or(json!(0));
-            let reply = self.commit_state(&base, &next);
+            // An import adds its package to the profile it was requested for, a
+            // reimport too when that profile lacks it; one that names none means
+            // Japanese and leaves every profile's list as it is.
+            let joining = match profile_id {
+                Some(profile_id) => Joining { profile_id, joins: joined_ids(&next, Some(path.as_str())) },
+                None => Joining::JAPANESE,
+            };
+            let reply = match self.commit_state(&state, &next, &joining) {
+                Ok(reply) => reply,
+                Err(error) => {
+                    let _ = self.restore();
+                    return Err(error);
+                }
+            };
             if is_true(&reply, "ok") {
                 let committed = reply.get("state");
                 if !strict_eq(committed.and_then(|state| state.get("schemaVersion")), Some(&json!(1)))

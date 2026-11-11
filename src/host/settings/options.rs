@@ -11,7 +11,9 @@ use std::sync::OnceLock;
 
 use serde_json::{Map, Value, json};
 
+use super::profiles;
 use crate::host::js::{self, plain_object, strict_eq, truthy, type_of};
+use crate::host::profile::JAPANESE;
 
 const ANKI_FIELDS: [&str; 8] = ["expression", "reading", "definition", "sentence", "frequency", "pitch", "audio", "screenshot"];
 const ANKI_DUPLICATE_SCOPES: [&str; 3] = ["model", "deck", "all"];
@@ -21,7 +23,7 @@ const STABLE_ID_MAX_LENGTH: usize = 256;
 pub(crate) const ANKI_TEMPLATE_CONFIG_KEYS: [&str; 8] =
     ["deck", "model", "tags", "fields", "duplicateScope", "duplicateBehavior", "captureScreenshot", "fieldTemplates"];
 const DEFAULT_ANKI_URL: &str = "http://127.0.0.1:8765";
-const EXPERIMENTAL_FEATURES: [&str; 3] = ["googleDocs", "netflixMining", "netflixPreviewScreenshots"];
+const EXPERIMENTAL_FEATURES: [&str; 3] = ["netflixMining", "crunchyrollMining", "multipleLanguages"];
 
 /// `KEYBIND_ACTIONS`: each action and the kind of argument it takes.
 const KEYBIND_ACTIONS: &[(&str, Option<&str>)] = &[
@@ -79,7 +81,7 @@ const SEARCH_KEYBINDS: [(&str, &str, &str, &[&str]); 7] = [
     ("searchRowDown", "", "ArrowDown", &[]),
     ("addNote", "", "Enter", &[]),
 ];
-const UNTOGGLED_OPTIONS: [&str; 10] = [
+const UNTOGGLED_OPTIONS: [&str; 12] = [
     "lowMemoryMode",
     "useLessRamByDefault",
     "smallerAnkiCards",
@@ -90,8 +92,12 @@ const UNTOGGLED_OPTIONS: [&str; 10] = [
     "wordHighlightIgnored",
     "showToolbarSearchButton",
     "searchHistoryEnabled",
+    "googleDocs",
+    "youtubeMining",
 ];
 const NUMBER_RANGES: &[(&str, f64, f64)] = &[
+    ("videoAudioBitrate", 32.0, 128.0),
+    ("videoImageQuality", 1.0, 100.0),
     ("scanLength", 1.0, 64.0),
     ("maxResults", 1.0, 256.0),
     ("scanDelayMs", 0.0, 5000.0),
@@ -163,7 +169,9 @@ const POPUP_THEMES: [&str; 48] = [
     "bee",
     "crystal",
 ];
-const ENUMERATED_OPTIONS: [(&str, &[&str]); 15] = [
+const ENUMERATED_OPTIONS: [(&str, &[&str]); 17] = [
+    ("videoAudioFormat", &["mp3", "opus"]),
+    ("videoImageFormat", &["gif", "webp", "avif"]),
     ("dictionaryEntryStorage", &["auto", "paged", "resident"]),
     ("dictionaryIndexStorage", &["auto", "paged", "resident"]),
     ("lookupMode", &["hover", "activation", "activationSticky"]),
@@ -176,7 +184,7 @@ const ENUMERATED_OPTIONS: [(&str, &[&str]); 15] = [
     ("definitionBlurDirection", &["atLeast", "below"]),
     ("definitionBlurReveal", &["timed", "hover", "click"]),
     ("imageHoverPreview", &["off", "large", "all"]),
-    ("glossaryLayoutMode", &["default", "compact"]),
+    ("glossaryLayoutMode", &["default", "compact", "compact-popup-anki"]),
     ("pitchAccentFuriganaStyle", &["contour", "overline"]),
     ("wordHighlightStyle", &["underline", "color", "background"]),
 ];
@@ -188,6 +196,7 @@ fn activation_name(value: &str) -> Option<String> {
     static NAMES: OnceLock<Vec<String>> = OnceLock::new();
     let names = NAMES.get_or_init(|| {
         let mut names: Vec<String> = [
+            "MouseRight",
             "MouseMiddle",
             "MouseBack",
             "MouseForward",
@@ -260,12 +269,12 @@ pub(crate) fn defaults() -> &'static Map<String, Value> {
             DEFAULT_KEYBINDS.iter().map(|(action, argument, key, modifiers)| keybind(action, argument, key, modifiers, "popup")).collect();
         keybinds.extend(search_keybinds());
         let options = object(json!({
-            "scanLength": 16, "maxResults": 32, "hoverEnabled": true, "onlyScanJapaneseText": true,
+            "scanLength": 16, "maxResults": 32, "hoverEnabled": true, "onlyScanJapaneseText": true, "googleDocs": true,
             "personalDictionaryEnabled": true, "showNoResultNotice": true, "lookupMode": "activationSticky",
             "activationKey": "Shift", "definitionLookupMode": "inherit", "scanDelayMs": 0, "definitionScanDelayMs": null,
             "popupHideDelayMs": 160, "hidePopupOnCursorExit": false, "hidePopupOnCursorExitDelayMs": 160,
             "showMetadataOnlyResults": false, "popupNestingMaxDepth": 10, "popupTheme": "default",
-            "popupThemeVariant": "auto", "popupToolbarPosition": "auto", "customPopupCss": "", "customPopupJavascript": "",
+            "popupThemeVariant": "auto", "popupToolbarPosition": "auto", "customPopupCss": "", "userScripts": [],
             "customLinks": [], "customButtons": [],
             "audioSources": [{ "id": "default-tts", "type": "text-to-speech-reading", "enabled": true, "url": "", "voice": "" }],
             "audioAutoplay": false, "anki": anki, "smallerAnkiCards": false, "experimental": experimental,
@@ -273,6 +282,10 @@ pub(crate) fn defaults() -> &'static Map<String, Value> {
             "sourceHighlightEnabled": true, "showPopupAudioButton": true, "popupColumns": 1, "glossaryLayoutMode": "default",
         }));
         let mut options = options;
+        options.extend(object(json!({
+            "youtubeMining": true, "videoAudioFormat": "mp3", "videoAudioBitrate": 64, "videoImageFormat": "gif",
+            "videoImageQuality": 70,
+        })));
         options.extend(object(json!({
             "showLookupCounts": true, "definitionBlurCountEnabled": false, "definitionBlurAnkiMature": false,
             "definitionBlurFrequencyEnabled": false, "definitionBlurFrequencyDictionary": "",
@@ -319,7 +332,7 @@ fn clamp_option(key: &str, value: &Value) -> Value {
     js::number(number.trunc().clamp(min, max))
 }
 
-fn normalise_experimental(value: Option<&Value>) -> Value {
+pub(crate) fn normalise_experimental(value: Option<&Value>) -> Value {
     let source = plain_object(value);
     Value::Object(
         EXPERIMENTAL_FEATURES
@@ -434,7 +447,7 @@ fn normalise_custom_links(value: &Value) -> Vec<Value> {
         .collect()
 }
 
-fn valid_identifier(value: Option<&Value>) -> Option<&str> {
+pub(crate) fn valid_identifier(value: Option<&Value>) -> Option<&str> {
     text(value).filter(|id| !id.is_empty() && js::length(id) <= STABLE_ID_MAX_LENGTH && !js::has_control(id))
 }
 
@@ -468,6 +481,50 @@ pub(crate) fn normalise_custom_buttons(value: &Value) -> Value {
         buttons.push(normalized);
     }
     Value::Array(buttons)
+}
+
+/// `normaliseScriptStoreSource`: an installed Script Store package's slug and version.
+fn normalise_script_store_source(value: Option<&Value>) -> Option<Value> {
+    let slug = text(value.and_then(|value| field(value, "slug"))).filter(|slug| !slug.is_empty())?;
+    let version = text(value.and_then(|value| field(value, "version"))).filter(|version| !version.is_empty())?;
+    Some(json!({ "slug": slug, "version": version }))
+}
+
+/// `normaliseUserScripts`: packages of JavaScript and CSS, in the order they run.
+fn normalise_user_scripts(value: &Value) -> Value {
+    let Some(items) = value.as_array() else { return json!([]) };
+    let mut ids = HashSet::new();
+    let mut scripts = Vec::new();
+    for script in items {
+        let Some(id) = valid_identifier(field(script, "id")) else { continue };
+        let name = text(field(script, "name")).filter(|name| !js::trim(name).is_empty() && !js::has_control(name));
+        let (Some(name), Some(enabled), Some(javascript), Some(css)) =
+            (name, field(script, "enabled").and_then(Value::as_bool), text(field(script, "javascript")), text(field(script, "css")))
+        else {
+            continue;
+        };
+        if !ids.insert(id.to_owned()) {
+            continue;
+        }
+        let mut normalized = json!({ "id": id, "name": name, "enabled": enabled, "javascript": javascript, "css": css });
+        if let Some(store) = normalise_script_store_source(field(script, "store")) {
+            normalized["store"] = store;
+        }
+        scripts.push(normalized);
+    }
+    Value::Array(scripts)
+}
+
+/// `legacyUserScriptsOption`: Design -> Custom JavaScript became the first user
+/// script. Only stored records and backups migrate, so a linked browser's write
+/// that still carries Custom JavaScript cannot replace the packages.
+fn legacy_user_scripts_option(source: &Map<String, Value>, strict: bool) -> Map<String, Value> {
+    match source.get("customPopupJavascript").and_then(Value::as_str) {
+        Some(code) if !strict && !source.contains_key("userScripts") && !js::trim(code).is_empty() => object(json!({
+            "userScripts": [{ "id": "custom-javascript", "name": "Custom JavaScript", "enabled": true, "javascript": code, "css": "" }],
+        })),
+        _ => Map::new(),
+    }
 }
 
 fn custom_links_from_buttons(buttons: &Value) -> Value {
@@ -702,11 +759,14 @@ fn valid_anki(value: &Value, normalized: &Value) -> bool {
     valid_anki_projection(fields, normalized)
 }
 
+/// `normaliseActivationKey`: a listed key by its stored name; any other
+/// non-empty name is kept, as Settings records any key or button.
 fn normalise_activation_key(value: &Value) -> Value {
-    if value.as_str() == Some(" ") {
-        return json!("Space");
+    match value.as_str() {
+        Some(" ") => json!("Space"),
+        Some(name) if !name.is_empty() => json!(activation_name(name).unwrap_or_else(|| name.to_owned())),
+        _ => json!("Shift"),
     }
-    json!(value.as_str().and_then(activation_name).unwrap_or_else(|| "Shift".to_owned()))
 }
 
 fn normalise_kanji_selection(value: &Value) -> Value {
@@ -758,6 +818,7 @@ fn normalise_field(key: &str, value: &Value) -> Value {
         "audioSources" => normalise_audio_sources(value),
         "customLinks" => Value::Array(normalise_custom_links(value)),
         "customButtons" => normalise_custom_buttons(value),
+        "userScripts" => normalise_user_scripts(value),
         "keybinds" => normalise_keybinds(value),
         "anki" => normalise_anki(Some(value)),
         "experimental" => normalise_experimental(Some(value)),
@@ -779,6 +840,15 @@ fn valid_option_field(key: &str, raw: &Value, normalized: &Value) -> bool {
                 && normalized.iter().zip(raw).all(|(bind, raw)| {
                     bind.as_object()
                         .is_some_and(|bind| bind.iter().all(|(field, value)| raw.get(field).is_some_and(|raw| js::same_json(raw, value))))
+                })
+        }
+        "userScripts" => {
+            let (Some(raw), Some(normalized)) = (raw.as_array(), normalized.as_array()) else { return false };
+            raw.len() == normalized.len()
+                && normalized.iter().zip(raw).all(|(script, raw)| {
+                    let (Some(script), Some(raw)) = (script.as_object(), raw.as_object()) else { return false };
+                    raw.len() == script.len()
+                        && script.iter().all(|(field, value)| raw.get(field).is_some_and(|raw| js::same_json(raw, value)))
                 })
         }
         "audioSources" | "customLinks" | "customButtons" => {
@@ -820,11 +890,12 @@ fn legacy_blur_count_option(source: &Map<String, Value>, strict: bool) -> Result
 }
 
 /// `projectOptions`.
-fn project_options(value: Option<&Value>, strict: bool) -> Result<Map<String, Value>, String> {
+pub(crate) fn project_option_keys(value: Option<&Value>, strict: bool) -> Result<Map<String, Value>, String> {
     let empty = Map::new();
     let source = plain_object(value).unwrap_or(&empty);
     let mut result = legacy_activation_options(source, strict)?;
     result.extend(legacy_blur_count_option(source, strict)?);
+    result.extend(legacy_user_scripts_option(source, strict));
     if !source.contains_key("smallerAnkiCards")
         && let Some(flag) =
             source.get("experimental").and_then(|experimental| experimental.get("smallerAnkiCards")).filter(|flag| flag.is_boolean())
@@ -849,9 +920,14 @@ fn project_options(value: Option<&Value>, strict: bool) -> Result<Map<String, Va
     Ok(result)
 }
 
-/// `projectStoredOptions`.
+/// `projectStoredOptions`: a record with profiles reads, for code that predates
+/// them, as its Japanese profile flattened with the global keys.
 pub(crate) fn project_stored(value: Option<&Value>) -> Map<String, Value> {
-    project_options(value, false).unwrap_or_default()
+    if profiles::has_profiles(value) {
+        let flat = Value::Object(profiles::flat_profile_record(value, JAPANESE));
+        return project_option_keys(Some(&flat), false).unwrap_or_default();
+    }
+    project_option_keys(value, false).unwrap_or_default()
 }
 
 /// `validateOptionsPatch`.
@@ -859,11 +935,19 @@ pub(crate) fn validate_patch(value: Option<&Value>) -> Result<Map<String, Value>
     if plain_object(value).is_none() {
         return Err("the options write request carried no object".to_owned());
     }
-    project_options(value, true)
+    project_option_keys(value, true)
 }
 
-/// `normaliseOptions`.
+/// `normaliseOptions`: a record with profiles reads as its Japanese profile.
 pub(crate) fn normalise(value: Option<&Value>) -> Map<String, Value> {
+    if profiles::has_profiles(value) {
+        return normalise_flat(Some(&Value::Object(profiles::flat_profile_record(value, JAPANESE))));
+    }
+    normalise_flat(value)
+}
+
+/// `normaliseFlatOptions`.
+pub(crate) fn normalise_flat(value: Option<&Value>) -> Map<String, Value> {
     let mut options = defaults().clone();
     options.extend(project_stored(value));
     let carries_buttons = value.and_then(Value::as_object).is_some_and(|source| source.contains_key("customButtons"));
@@ -994,9 +1078,9 @@ mod tests {
                     }
                 }
                 "parseCustomDictionary" => {
-                    let (entries, errors) = super::super::custom::parse(input.and_then(Value::as_str).unwrap_or_default());
+                    let (entries, errors) = super::super::custom::parse(input.and_then(Value::as_str).unwrap_or_default(), true);
                     let revision =
-                        super::super::custom::semantic_revision(&entries).map_or_else(|error| json!({ "error": error }), Value::from);
+                        super::super::custom::semantic_revision(&entries, true).map_or_else(|error| json!({ "error": error }), Value::from);
                     let entries: Vec<Value> = entries
                         .iter()
                         .map(|entry| json!({ "term": entry.term, "reading": entry.reading, "definition": entry.definition }))
